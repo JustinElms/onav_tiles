@@ -32,7 +32,7 @@ def create_mbt_db(name: str) -> None:
 
 if __name__ == "__main__":
 
-    mbt_path = "test.mbtiles"
+    mbt_path = "/data/misc/shapes/onav.mbtiles"
 
     if not os.path.exists(mbt_path):
         create_mbt_db(mbt_path)
