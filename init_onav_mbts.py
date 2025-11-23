@@ -12,6 +12,8 @@ def get_tile_indexes(zoom) -> list:
         np.meshgrid(range(2**zoom), range(2**zoom), [zoom], indexing="ij")
     ).T.reshape(-1, 3)
 
+    xyz[:, 1] = xyz[::-1, 1]
+
     return xyz.astype(int)
 
 
