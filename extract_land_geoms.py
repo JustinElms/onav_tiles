@@ -87,9 +87,12 @@ def extract_water_geoms(mbt_path, x_bounds, y_bounds, z) -> gpd.GeoDataFrame:
         crs="EPSG:3857",
     )
     mbt_data = utils.extract_mbt(mbt_path, x_bounds, y_bounds, z)
-    mbt_gdf = gpd.GeoDataFrame.from_features(mbt_data["features"], crs=3857)
 
-    if len(mbt_gdf) > 0 and "class" in mbt_gdf.columns:
+    if len(mbt_data["features"]) == 0:
+        return water_df
+
+    mbt_gdf = gpd.GeoDataFrame.from_features(mbt_data["features"], crs=3857)
+    if "class" in mbt_gdf.columns:
         mbt_gdf = mbt_gdf[water_df.columns]
         water_df = pd.concat(
             [
