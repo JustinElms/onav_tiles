@@ -1,6 +1,9 @@
 import configparser
+import gzip
+import sqlite3
 
 import cartopy.crs as ccrs
+import mapbox_vector_tile
 import numpy as np
 
 
@@ -66,3 +69,54 @@ def read_config() -> dict:
     config.read("onav_tiles.cfg")
 
     return config["DEFAULT"]
+
+
+def extract_mbt(tile_path: str, x: int | list, y: int | list, z: int) -> dict:
+    con = sqlite3.connect(tile_path)
+    cur = con.cursor()
+    if isinstance(x, list) and isinstance(y, list):
+        sqlite = f"SELECT * FROM tiles WHERE zoom_level = {z} AND tile_column BETWEEN {x[0]} AND {x[1]} AND tile_row BETWEEN {y[0]} AND {y[1]}"
+    else:
+        sqlite = f"SELECT * FROM tiles WHERE zoom_level = {z} AND tile_column = {x} AND tile_row = {y}"
+    cur.execute(sqlite)
+    new_tiles = cur.fetchall()
+    con.close()
+    if new_tiles is None:
+        return []
+
+    decoded_data = [
+        [t[1], t[2], t[0], mapbox_vector_tile.decode(gzip.decompress(t[3]))]
+        for t in new_tiles
+    ]
+    layers = {}
+    for data in decoded_data:
+        for key in data[-1]:
+            if key not in layers:
+                layers[key] = {"features": []}
+            entry = [
+                {**d, "x": data[0], "y": data[1], "z": data[2]}
+                for d in data[-1][key]["features"]
+            ]
+            layers[key]["features"].extend(entry)
+
+    features = []
+    # unpack features for each layer into the list
+    for key in layers.keys():
+        for feature in layers[key]["features"]:
+            features.append(
+                {
+                    "layer": key,
+                    "geometry": feature["geometry"],
+                    "properties": {
+                        "layer": key,
+                        "id": feature["id"],
+                        "x": feature["x"],
+                        "y": feature["y"],
+                        "z": feature["z"],
+                        **feature["properties"],
+                    },
+                    "type": "Feature",
+                }
+            )
+
+    return {"type": "FeatureCollection", "features": features}

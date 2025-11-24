@@ -62,57 +62,6 @@ def read_osm_land_polys(wm_bbox: np.array) -> gpd.GeoDataFrame:
     return land_df
 
 
-def extract_mbt(tile_path: str, x: int | list, y: int | list, z: int) -> str:
-    con = sqlite3.connect(tile_path)
-    cur = con.cursor()
-    if isinstance(x, list) and isinstance(y, list):
-        sqlite = f"SELECT * FROM tiles WHERE zoom_level = {z} AND tile_column BETWEEN {x[0]} AND {x[1]} AND tile_row BETWEEN {y[0]} AND {y[1]}"
-    else:
-        sqlite = f"SELECT * FROM tiles WHERE zoom_level = {z} AND tile_column = {x} AND tile_row = {y}"
-    cur.execute(sqlite)
-    new_tiles = cur.fetchall()
-    con.close()
-    if new_tiles is None:
-        return []
-
-    decoded_data = [
-        [t[1], t[2], t[0], mapbox_vector_tile.decode(gzip.decompress(t[3]))]
-        for t in new_tiles
-    ]
-    layers = {}
-    for data in decoded_data:
-        for key in data[-1]:
-            if key not in layers:
-                layers[key] = {"features": []}
-            entry = [
-                {**d, "x": data[0], "y": data[1], "z": data[2]}
-                for d in data[-1][key]["features"]
-            ]
-            layers[key]["features"].extend(entry)
-
-    features = []
-    # unpack features for each layer into the list
-    for key in layers.keys():
-        for feature in layers[key]["features"]:
-            features.append(
-                {
-                    "layer": key,
-                    "geometry": feature["geometry"],
-                    "properties": {
-                        "layer": key,
-                        "id": feature["id"],
-                        "x": feature["x"],
-                        "y": feature["y"],
-                        "z": feature["z"],
-                        **feature["properties"],
-                    },
-                    "type": "Feature",
-                }
-            )
-
-    return geojson.dumps({"type": "FeatureCollection", "features": features})
-
-
 def global_tile_coords(
     coords: np.array,
     x: int,
@@ -142,7 +91,7 @@ def extract_water_geoms(mbt_path, x_bounds, y_bounds, z) -> gpd.GeoDataFrame:
         geometry="geometry",
         crs="EPSG:3857",
     )
-    mbt_data = extract_mbt(mbt_path, x_bounds, y_bounds, z)
+    mbt_data = utils.extract_mbt(mbt_path, x_bounds, y_bounds, z)
     mbt_gdf = gpd.read_file(mbt_data)
 
     if len(mbt_gdf) > 0:
