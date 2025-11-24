@@ -99,10 +99,9 @@ def get_etopo_paths(pc_ext) -> list:
         xxx = int(15 * np.ceil(abs(cx) / 15))
 
     yy = "N"
-    yyy = int(15 * np.ceil(abs(cy) / 15))
-    if cy < 0:
+    yyy = int(15 * np.ceil(cy / 15))
+    if cy < -15:
         yy = "S"
-        yyy = int(15 * np.floor(abs(cy) / 15))
 
     bed_path = f"/data/misc/ETOPO2022/15s/15s_bed_elev_netcdf/ETOPO_2022_v1_15s_{yy}{yyy:02d}{xx}{xxx:03d}_bed.nc"
     surf_path = f"/data/misc/ETOPO2022/15s/15s_surface_elev_netcdf/ETOPO_2022_v1_15s_{yy}{yyy:02d}{xx}{xxx:03d}_surface.nc"
