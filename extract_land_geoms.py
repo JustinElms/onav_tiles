@@ -1,43 +1,20 @@
 import gzip
-import multiprocessing
-import os
-import pickle
 import sqlite3
 
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-import cv2
 import geojson
 import geopandas as gpd
-import mercantile
 import mapbox_vector_tile
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import xarray as xr
 from shapely import (
     box,
     empty,
     GeometryType,
     make_valid,
-    LineString,
-    MultiLineString,
-    MultiPolygon,
-    remove_repeated_points,
-    points,
-    Polygon,
-    prepare,
     transform,
-    unary_union,
-    union_all,
 )
-from skimage import measure
-from scipy.ndimage import binary_fill_holes
 
-# from mbt_generator_v2 import MBTGenerator
-
-OSM_MBT_PATH = "/data/misc/osm/tiles/maptiler-osm-2020-02-10-v3.11-planet.mbtiles"
-OSM_LAND_POLY_PATH = "/data/misc/osm/land-polygons-complete-3857/land_polygons.shp"
+import utils
 
 
 def wm_to_global_tile_coords(coords: np.array) -> np.array:
@@ -68,8 +45,10 @@ def wm_to_global_tile_coords(coords: np.array) -> np.array:
 
 def read_osm_land_polys(wm_bbox: np.array) -> gpd.GeoDataFrame:
 
+    config = utils.read_config()
+
     land_df = gpd.read_file(
-        OSM_LAND_POLY_PATH,
+        config["OSM_LAND_POLY_PATH"],
         bbox=tuple(wm_bbox.bounds),
     )
     land_df = land_df.set_geometry(land_df.geometry.intersection(wm_bbox))
@@ -197,11 +176,13 @@ def extract_water_geoms(mbt_path, x_bounds, y_bounds, z) -> gpd.GeoDataFrame:
 
 def extract_land_geoms(xy_coords: np.array, wm_bbox: box) -> gpd.GeoDataFrame:
 
+    config = utils.read_config()
+
     x_bounds = [np.min(xy_coords[:, 0]), np.max(xy_coords[:, 0])]
     y_bounds = [np.min(xy_coords[:, 0]), np.max(xy_coords[:, 0])]
 
     land_df = read_osm_land_polys(wm_bbox)
-    water_df = extract_water_geoms(OSM_MBT_PATH, x_bounds, y_bounds, 14)
+    water_df = extract_water_geoms(config["OSM_MBT_PATH"], x_bounds, y_bounds, 14)
 
     land_df.geometry = land_df.difference(water_df.union_all())
 

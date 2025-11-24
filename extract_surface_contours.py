@@ -11,7 +11,6 @@ from scipy.ndimage import binary_fill_holes
 
 
 levels = np.array([100, 200, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 15000])
-osm_mbt_path = "/data/misc/osm/tiles/maptiler-osm-2020-02-10-v3.11-planet.mbtiles"
 
 
 def get_contour_df(

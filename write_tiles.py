@@ -30,7 +30,7 @@ def write_tiles(mbt_df: gpd.GeoDataFrame, mbt_path: str) -> None:
             ]
         )
 
-    con = sqlite3.connect("test.mbtiles")
+    con = sqlite3.connect(mbt_path)
     cur = con.cursor()
 
     for tile in tile_data:

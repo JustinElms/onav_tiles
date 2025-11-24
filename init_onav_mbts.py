@@ -4,6 +4,7 @@ import sqlite3
 
 import numpy as np
 
+import utils
 from build_tile_block import build_tile_block
 
 
@@ -34,7 +35,9 @@ def create_mbt_db(name: str) -> None:
 
 if __name__ == "__main__":
 
-    mbt_path = "/data/misc/shapes/onav.mbtiles"
+    config = utils.read_config()
+
+    mbt_path = config["OUTPUT_PATH"]
 
     if not os.path.exists(mbt_path):
         create_mbt_db(mbt_path)
@@ -42,9 +45,6 @@ if __name__ == "__main__":
     tile_indexes = get_tile_indexes(8)
 
     inputs = np.column_stack((tile_indexes, np.repeat(mbt_path, len(tile_indexes))))
-
-    for input in inputs:
-        build_tile_block(input)
 
     with multiprocessing.Pool() as pool:
         pool.map(build_tile_block, inputs)

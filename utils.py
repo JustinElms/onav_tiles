@@ -1,40 +1,7 @@
-import gzip
-import multiprocessing
-import os
-import pickle
-import sqlite3
+import configparser
 
 import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-import cv2
-import geojson
-import geopandas as gpd
-import mercantile
-import mapbox_vector_tile
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import xarray as xr
-from shapely import (
-    box,
-    empty,
-    GeometryType,
-    make_valid,
-    LineString,
-    MultiLineString,
-    MultiPolygon,
-    remove_repeated_points,
-    points,
-    Polygon,
-    prepare,
-    transform,
-    unary_union,
-    union_all,
-)
-from skimage import measure
-from scipy.ndimage import binary_fill_holes
-
-# from mbt_generator_v2 import MBTGenerator
 
 
 def tile_coords_to_ll(coords: np.array, x: int, y: int, z: int) -> np.array:
@@ -70,9 +37,9 @@ def get_z14_tile_coords(x: int, y: int, z: int) -> np.array:
     returns indicies of zoom level 14 tiles that span tile specified by input coordinates
     """
 
-    x14_0 = (2**14 * x / 2**z)
+    x14_0 = 2**14 * x / 2**z
     x14_1 = (2**14 * (x + 1) / 2**z) - 1
-    y14_0 = (2**14 * y / 2**z)
+    y14_0 = 2**14 * y / 2**z
     y14_1 = (2**14 * (y + 1) / 2**z) - 1
 
     x14_idxs = np.arange(x14_0, x14_1 + 1)
@@ -81,3 +48,11 @@ def get_z14_tile_coords(x: int, y: int, z: int) -> np.array:
     z14_xy = np.array(np.meshgrid(x14_idxs, y14_idxs)).T.reshape(-1, 2).astype(int)
 
     return z14_xy
+
+
+def read_config() -> dict:
+    config = configparser.ConfigParser()
+
+    config.read("onav_tiles.cfg")
+
+    return config["DEFAULT"]

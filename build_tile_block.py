@@ -48,7 +48,9 @@ def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
     y = int(y)
     z = int(z)
 
-    pkl_name = f"contours_{x}_{y}_{z}.pkl"
+    config = utils.read_config()
+
+    pkl_name = f"{config["PKL_PATH"]}/contours_{x}_{y}_{z}.pkl"
     if os.path.exists(pkl_name):
         mbt_df = pd.read_pickle(pkl_name)
     else:
