@@ -44,6 +44,8 @@ def calculate_block_bbox(x, y, z) -> box:
 def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
     x, y, z, mbt_path = inputs
 
+    print(f"Starting {[x,y,z]}")
+
     x = int(x)
     y = int(y)
     z = int(z)
@@ -59,7 +61,9 @@ def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
         z14_tile_coords = utils.get_z14_tile_coords(x, y, z)
         land_df = extract_land_geoms(z14_tile_coords, wm_bbox)
 
-        mbt_df = gpd.GeoDataFrame(columns=["x", "y", "ext", "geometry"], crs=3857)
+        mbt_df = gpd.GeoDataFrame(
+            columns=["x", "y", "ext", "geometry"], crs=3857
+        )
         mbt_df["x"] = z14_tile_coords[:, 0]
         mbt_df["y"] = z14_tile_coords[:, 1]
         mbt_df = mbt_df.apply(calculate_df_bbox, axis=1)

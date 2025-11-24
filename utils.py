@@ -50,6 +50,16 @@ def get_z14_tile_coords(x: int, y: int, z: int) -> np.array:
     return z14_xy
 
 
+def get_tile_indexes(zoom) -> list:
+    xyz = np.array(
+        np.meshgrid(range(2**zoom), range(2**zoom), [zoom], indexing="ij")
+    ).T.reshape(-1, 3)
+
+    xyz[:, 1] = xyz[::-1, 1]
+
+    return xyz.astype(int)
+
+
 def read_config() -> dict:
     config = configparser.ConfigParser()
 
