@@ -1,9 +1,4 @@
-import gzip
-import sqlite3
-
-import geojson
 import geopandas as gpd
-import mapbox_vector_tile
 import numpy as np
 import pandas as pd
 from shapely import (
@@ -92,29 +87,20 @@ def extract_water_geoms(mbt_path, x_bounds, y_bounds, z) -> gpd.GeoDataFrame:
         crs="EPSG:3857",
     )
     mbt_data = utils.extract_mbt(mbt_path, x_bounds, y_bounds, z)
-    mbt_gdf = gpd.read_file(mbt_data)
+    mbt_gdf = gpd.GeoDataFrame.from_features(mbt_data["features"], crs=3857)
 
-    if len(mbt_gdf) > 0:
-
+    if len(mbt_gdf) > 0 and "class" in mbt_gdf.columns:
         mbt_gdf = mbt_gdf[water_df.columns]
-
-        mbt_gdf.set_crs(3857, inplace=True, allow_override=True)
-
-        if "class" in mbt_gdf.columns:
-            water_df = pd.concat(
-                [
-                    water_df,
-                    mbt_gdf[
-                        (mbt_gdf["class"] == "river") | (mbt_gdf["class"] == "lake")
-                    ],
-                ],
-                ignore_index=True,
-            )
-            invalid_idxs = water_df.loc[~water_df.geometry.is_valid].index
-            for idx in invalid_idxs:
-                water_df.loc[idx, "geometry"] = make_valid(
-                    water_df.loc[idx, "geometry"]
-                )
+        water_df = pd.concat(
+            [
+                water_df,
+                mbt_gdf[(mbt_gdf["class"] == "river") | (mbt_gdf["class"] == "lake")],
+            ],
+            ignore_index=True,
+        )
+        invalid_idxs = water_df.loc[~water_df.geometry.is_valid].index
+        for idx in invalid_idxs:
+            water_df.loc[idx, "geometry"] = make_valid(water_df.loc[idx, "geometry"])
     water_df = water_df.explode()
     water_df = water_df.loc[water_df.geometry.geometry.type == "Polygon"]
     water_df.drop(columns=["layer", "id", "class"], inplace=True)

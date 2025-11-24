@@ -44,7 +44,8 @@ def calculate_block_bbox(x, y, z) -> box:
 def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
     x, y, z, mbt_path = inputs
 
-    print(f"Starting {[x,y,z]}")
+    idx_str = ", ".join(map(str, [x,y,z]))
+    print(f"Starting ({idx_str})")
 
     x = int(x)
     y = int(y)
@@ -76,4 +77,4 @@ def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
 
     write_tiles(mbt_df, mbt_path)
 
-    print(f"Completed {[x,y,z]}")
+    print(f"Completed ({idx_str})")
