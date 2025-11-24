@@ -17,7 +17,7 @@ def write_tiles(mbt_df: gpd.GeoDataFrame, mbt_path: str) -> None:
                 "geometry": layer.geometry,
                 "properties": {
                     "id": layer.index,
-                    "layer": f"{layer.type}_{layer.level}",
+                    "layer": f"{layer.layer_type}_{layer.level}",
                 },
             }
             features.append(feat)

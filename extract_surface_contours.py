@@ -22,7 +22,7 @@ def get_contour_df(
     y_coords,
 ) -> gpd.GeoDataFrame:
     contour_df = gpd.GeoDataFrame(
-        columns=["geometry", "level", "type"], geometry="geometry", crs=3857
+        columns=["geometry", "level", "layer_type"], geometry="geometry", crs=3857
     )
     for idx, level in enumerate(levels):
         mask = surface.z.values.copy()
@@ -57,11 +57,11 @@ def get_contour_df(
         n_contours = len(level_contours)
         if n_contours > 0:
             level_df = gpd.GeoDataFrame(
-                columns=["geometry", "level", "type"], geometry="geometry", crs=3857
+                columns=["geometry", "level", "layer_type"], geometry="geometry", crs=3857
             )
             level_df.geometry = level_contours
             level_df.level = idx + 1
-            level_df.type = contour_type
+            level_df.layer_type = contour_type
             contour_df = pd.concat([contour_df, level_df])
 
     contour_df.geometry = contour_df.make_valid(
@@ -135,7 +135,10 @@ def extract_surface_contours(mbt_df, land_df, pc_ext) -> gpd.GeoDataFrame:
         ice["z"].data = ice["z"].data * np.nan
         ice["z"].data[diff >= 10] = surface["z"].data[diff >= 10]
 
-        surface["z"].data[diff >= 10] = np.nanmax(surface["z"].data[diff < 10])
+        if len(diff[diff < 10]) == 0:
+            surface["z"].data = surface["z"].data * np.nan
+        else:
+            surface["z"].data[diff >= 10] = np.nanmax(surface["z"].data[diff < 10])
 
     # convert lat lon to tile pixel coordinates
     pc_crs = ccrs.PlateCarree()
@@ -175,7 +178,9 @@ def extract_surface_contours(mbt_df, land_df, pc_ext) -> gpd.GeoDataFrame:
 
     output_df = pd.concat([bathy_contours, land_contours])
     if bed:
-        ice_contours = get_contour_df(ice, levels, "ice", land_geom, x_coords, y_coords)
+        ice_contours = get_contour_df(
+            ice, np.insert(levels, 0, -100), "ice", land_geom, x_coords, y_coords
+        )
         output_df = pd.concat([output_df, ice_contours])
 
     output_df = mbt_df.apply(lambda row: clip_df_contours(row, output_df), axis=1)
@@ -184,9 +189,8 @@ def extract_surface_contours(mbt_df, land_df, pc_ext) -> gpd.GeoDataFrame:
 
     output_df.sort_values(by=["x", "y", "level"], ignore_index=True, inplace=True)
 
-    reduced_geoms = output_df.normalize().drop_duplicates(keep="last")
+    dup_geoms = output_df.normalize().drop_duplicates(keep="last")
 
-    output_df = output_df.loc[reduced_geoms.index]
-    output_df.loc["geometry"] = reduced_geoms
+    output_df = output_df.loc[dup_geoms.index].reset_index(drop=True)
 
     return output_df

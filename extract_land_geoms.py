@@ -51,8 +51,8 @@ def read_osm_land_polys(wm_bbox: np.array) -> gpd.GeoDataFrame:
     land_df.geometry = land_df.transform(wm_to_global_tile_coords)
     land_df.drop(columns=["FID"], inplace=True)
     land_df["level"] = 0
-    land_df["type"] = "land"
-    land_df = land_df.dissolve(by=["level", "type"], as_index=False)
+    land_df["layer_type"] = "land"
+    land_df = land_df.dissolve(by=["level", "layer_type"], as_index=False)
 
     return land_df
 
