@@ -53,28 +53,34 @@ def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
 
     config = utils.read_config()
 
-    pkl_name = f"{config["PKL_PATH"]}/contours_{x}_{y}_{z}.pkl"
-    if os.path.exists(pkl_name):
-        mbt_df = pd.read_pickle(pkl_name)
-    else:
-        wm_bbox = calculate_block_bbox(x, y, z)
+    try:
 
-        z14_tile_coords = utils.get_z14_tile_coords(x, y, z)
-        land_df = extract_land_geoms(z14_tile_coords, wm_bbox)
+        pkl_name = f"{config["PKL_PATH"]}/contours_{x}_{y}_{z}.pkl"
+        if os.path.exists(pkl_name):
+            mbt_df = pd.read_pickle(pkl_name)
+        else:
+            wm_bbox = calculate_block_bbox(x, y, z)
 
-        mbt_df = gpd.GeoDataFrame(
-            columns=["x", "y", "ext", "geometry"], crs=3857
-        )
-        mbt_df["x"] = z14_tile_coords[:, 0]
-        mbt_df["y"] = z14_tile_coords[:, 1]
-        mbt_df = mbt_df.apply(calculate_df_bbox, axis=1)
+            z14_tile_coords = utils.get_z14_tile_coords(x, y, z)
+            land_df = extract_land_geoms(z14_tile_coords, wm_bbox)
 
-        pc_ext = utils.calculate_tile_ext(x, y, z, crs="pc")
+            mbt_df = gpd.GeoDataFrame(
+                columns=["x", "y", "ext", "geometry"], crs=3857
+            )
+            mbt_df["x"] = z14_tile_coords[:, 0]
+            mbt_df["y"] = z14_tile_coords[:, 1]
+            mbt_df = mbt_df.apply(calculate_df_bbox, axis=1)
 
-        mbt_df = extract_surface_contours(mbt_df, land_df, pc_ext)
+            pc_ext = utils.calculate_tile_ext(x, y, z, crs="pc")
 
-        mbt_df.to_pickle(pkl_name)
+            mbt_df = extract_surface_contours(mbt_df, land_df, pc_ext)
 
-    write_tiles(mbt_df, mbt_path)
+            mbt_df.to_pickle(pkl_name)
 
-    print(f"Completed ({idx_str})")
+        write_tiles(mbt_df, mbt_path)
+
+        print(f"Completed ({idx_str})")
+    except Exception as e:
+        with open(config["LOG_FILE"], "a") as f:
+            f.write(f"({idx_str})\n", e, "\n \n")
+            print(f"Error in tile ({idx_str})")
