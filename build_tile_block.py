@@ -82,5 +82,7 @@ def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
         print(f"Completed ({idx_str})")
     except Exception as e:
         with open(config["LOG_FILE"], "a") as f:
-            f.write(f"({idx_str})\n", e, "\n \n")
+            f.write(f"({idx_str})\n")
+            f.write(e)
+            f.write("\n \n")
             print(f"Error in tile ({idx_str})")
