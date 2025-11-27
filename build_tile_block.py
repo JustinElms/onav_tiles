@@ -3,7 +3,7 @@ import os
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely import box
+from shapely import box, transform
 
 import utils
 from extract_land_geoms import extract_land_geoms
@@ -41,10 +41,33 @@ def calculate_block_bbox(x, y, z) -> box:
     return wm_bbox
 
 
+def global_to_tile_coords(coords, x, y) -> np.array:
+    x_vals = coords[:, 0]
+    y_vals = coords[:, 1]
+
+    x_min = x * 4096
+    y_min = y * 4096
+
+    x_coords = x_vals - x_min
+    y_coords = y_vals - y_min
+
+    tile_based_coords = np.vstack([x_coords, y_coords]).T
+
+    return np.array(tile_based_coords, dtype=np.float64)
+
+
+def global_tile_transform(row):
+    row.geometry = transform(
+        row.geometry, lambda xy: global_to_tile_coords(xy, row.x, row.y)
+    )
+
+    return row
+
+
 def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
     x, y, z, mbt_path = inputs
 
-    idx_str = ", ".join(map(str, [x,y,z]))
+    idx_str = ", ".join(map(str, [x, y, z]))
     print(f"Starting ({idx_str})")
 
     x = int(x)
@@ -54,7 +77,6 @@ def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
     config = utils.read_config()
 
     try:
-
         pkl_name = f"{config["PKL_PATH"]}/contours_{x}_{y}_{z}.pkl"
         if os.path.exists(pkl_name):
             mbt_df = pd.read_pickle(pkl_name)
@@ -65,10 +87,11 @@ def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
             land_df = extract_land_geoms(z14_tile_coords, wm_bbox)
 
             mbt_df = gpd.GeoDataFrame(
-                columns=["x", "y", "ext", "geometry"], crs=3857
+                columns=["x", "y", "z", "ext", "geometry"], crs=3857
             )
             mbt_df["x"] = z14_tile_coords[:, 0]
             mbt_df["y"] = z14_tile_coords[:, 1]
+            mbt_df["z"] = 14
             mbt_df = mbt_df.apply(calculate_df_bbox, axis=1)
 
             pc_ext = utils.calculate_tile_ext(x, y, z, crs="pc")
@@ -77,12 +100,11 @@ def build_tile_block(inputs: np.array) -> gpd.GeoDataFrame:
 
             mbt_df.to_pickle(pkl_name)
 
+        mbt_df = mbt_df.apply(global_tile_transform, axis=1)
         write_tiles(mbt_df, mbt_path)
 
         print(f"Completed ({idx_str})")
-    except Exception as e:
+    except Exception:
         with open(config["LOG_FILE"], "a") as f:
             f.write(f"({idx_str})\n")
-            f.write(e)
-            f.write("\n \n")
             print(f"Error in tile ({idx_str})")

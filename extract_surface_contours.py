@@ -80,6 +80,7 @@ def clip_df_contours(row, contours):
     clipped = gpd.clip(contours, row.ext)
     clipped["x"] = row.x
     clipped["y"] = row.y
+    clipped["z"] = row.z
     return clipped
 
 
@@ -186,7 +187,7 @@ def extract_surface_contours(mbt_df, land_df, pc_ext) -> gpd.GeoDataFrame:
     output_df = pd.concat(output_df.values)
     output_df.reset_index(drop=True, inplace=True)
 
-    output_df.sort_values(by=["x", "y", "level"], ignore_index=True, inplace=True)
+    output_df.sort_values(by=["x", "y", "z", "level"], ignore_index=True, inplace=True)
 
     dup_geoms = output_df.normalize().drop_duplicates(keep="last")
 
