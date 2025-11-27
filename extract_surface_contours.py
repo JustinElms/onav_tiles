@@ -100,7 +100,7 @@ def get_etopo_paths(pc_ext) -> list:
         xxx = int(15 * np.ceil(abs(cx) / 15))
 
     yy = "N"
-    yyy = int(15 * np.ceil(cy / 15))
+    yyy = int(15 * np.ceil(abs(cy) / 15))
     if cy < -15:
         yy = "S"
 
