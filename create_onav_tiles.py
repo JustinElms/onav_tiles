@@ -28,6 +28,8 @@ from shapely import (
 )
 from shapely.affinity import scale
 
+MAX_WORKERS = 6
+
 ONAV_BASEMAP_DB = "/data/misc/shapes/onav_basemap.mbtiles"
 ONAV_LAND_MASK_DB = "/data/misc/shapes/onav_land_mask.mbtiles"
 ONAV_BATHY_DB = "/data/misc/shapes/onav_bathy.mbtiles"
@@ -457,7 +459,7 @@ def wm_to_tile_coords(wm_coords, zoom) -> np.ndarray:
     n_tiles = 2**zoom
 
     px_x = tile_res * n_tiles * (wm_x + wm_radius) / (2 * wm_radius)
-    px_y = tile_res * n_tiles * (wm_y + wm_radius) / (2 * wm_radius)
+    px_y = tile_res * n_tiles * (wm_radius-wm_y) / (2 * wm_radius)
 
     px_coords = np.vstack([px_x.astype(int), px_y.astype(int)]).T
 
@@ -900,21 +902,21 @@ if __name__ == "__main__":
     # ]
 
     # divide OSM files into managable chunks that match etopo bounds
-    with ProcessPoolExecutor(max_workers=4) as executor:
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         executor.map(split_osm_data, etopo_files)
 
     # extract contours from etopo and osm data
     print("Extract ETOPO contours.")
-    with ProcessPoolExecutor(max_workers=6) as executor:
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         executor.map(extract_etopo_contours, etopo_files)
 
-    print("Extract pixel/zoom contours.")
-    for etopo_file in etopo_files:
-        with ProcessPoolExecutor(max_workers=6) as executor:
-            executor.map(
-                etopo_px_contours, repeat(etopo_file), reversed(range(1, 15))
-            )
+    # print("Extract pixel/zoom contours.")
+    # for etopo_file in etopo_files:
+    #     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    #         executor.map(
+    #             etopo_px_contours, repeat(etopo_file), range(1, 15)
+    #         )
 
-    for etopo_file in etopo_files:
-        with ProcessPoolExecutor(max_workers=6) as executor:
-            executor.map(process_etopo, repeat(etopo_file), reversed(range(1, 15)))
+    # for etopo_file in etopo_files:
+    #     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    #         executor.map(process_etopo, repeat(etopo_file), range(1, 15))
