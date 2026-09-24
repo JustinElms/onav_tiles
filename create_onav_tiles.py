@@ -16,7 +16,9 @@ import geopandas as gpd
 import mapbox_vector_tile
 import numpy as np
 import pandas as pd
+import pyogrio
 import xarray as xr
+from osgeo import gdal
 from PIL import Image
 from rasterio import features
 from shapely import (
@@ -27,6 +29,8 @@ from shapely import (
     MultiPolygon,
 )
 from shapely.affinity import scale
+
+# gdal.SetConfigOption("OGR_INTERLEAVED_READING", "YES")
 
 MAX_WORKERS = 6
 
@@ -293,6 +297,8 @@ def read_osm_land_polys(wm_bbox: Polygon) -> gpd.GeoDataFrame:
     land_df = gpd.read_file(
         "/data/misc/osm/land-polygons-complete-3857/land_polygons.shp",
         bbox=tuple(wm_bbox.bounds),
+        engine="pyogrio",
+        use_arrow=True,
     )
     land_df = land_df.set_geometry(land_df.geometry.intersection(wm_bbox))
     land_df = land_df[~land_df.geometry.is_empty]
@@ -305,31 +311,31 @@ def read_osm_land_polys(wm_bbox: Polygon) -> gpd.GeoDataFrame:
     return land_df
 
 
-def get_osm_data(tile_id: str) -> gpd.GeoDataFrame:
+def osm_water_geoms(tile_id: str) -> gpd.GeoDataFrame:
+    sql_query = """
+        SELECT * FROM multipolygons 
+        WHERE "natural" = 'water' 
+        AND (
+            other_tags LIKE '%"water"=>"river"%'
+            OR other_tags LIKE '%"water"=>"lake"%'
+            OR other_tags LIKE '%"water"=>"pond"%'
+            OR other_tags LIKE '%"water"=>"canal"%'
+        )
+    """
+
     osm_files = glob.glob(f"/data/misc/osm/*{tile_id}_natural.osm.pbf")
 
     osm_geoms = []
     for osm_file in osm_files:
-        temp_df = gpd.read_file(
-            osm_file,
-            layer="multipolygons",
-            engine="pyogrio",
+        temp_df = pyogrio.read_dataframe(
+            osm_file, sql=sql_query, sql_dialect="SQLITE", use_arrow=True
         )
         temp_df = temp_df.to_crs(3857)
-        temp_df = temp_df[["osm_id", "natural", "other_tags", "geometry"]]
-        temp_df = temp_df[
-            (temp_df["natural"] == "water")
-            & (
-                temp_df["other_tags"].str.contains('"water"=>"river"')
-                | temp_df["other_tags"].str.contains('"water"=>"lake"')
-                | temp_df["other_tags"].str.contains('"water"=>"pond"')
-                | temp_df["other_tags"].str.contains('"water"=>"canal"')
-            )
-        ]
+        temp_df = temp_df[["geometry"]]
         temp_df.geometry = temp_df.make_valid(method="structure", keep_collapsed=False)
-        osm_geoms.append(temp_df.union_all())
+        osm_geoms.append(temp_df)
 
-    osm_df = gpd.GeoDataFrame({"geometry": osm_geoms}, crs=3857)
+    osm_df = pd.concat(osm_geoms)
 
     return osm_df
 
@@ -338,7 +344,7 @@ def get_coastline_polys(wm_bbox: np.ndarray, tile_id: str) -> gpd.GeoDataFrame:
     land_df = read_osm_land_polys(wm_bbox)
 
     if len(land_df) > 0:
-        osm_df = get_osm_data(tile_id)
+        osm_df = osm_water_geoms(tile_id)
 
         land_df.geometry = land_df.difference(osm_df)
 
@@ -353,6 +359,7 @@ def get_coastline_polys(wm_bbox: np.ndarray, tile_id: str) -> gpd.GeoDataFrame:
 
 
 def extract_etopo_contours(etopo_file: str | Path) -> None:
+    print(f"Checking for ETOPO contours for {etopo_file}")
     if not isinstance(etopo_file, Path):
         etopo_file = Path(etopo_file)
 
@@ -360,9 +367,10 @@ def extract_etopo_contours(etopo_file: str | Path) -> None:
 
     contour_path = f"/data/misc/ETOPO_contours/contour_{etopo_idx}.pkl"
     if os.path.exists(contour_path):
+        print(f"ETOPO contours already produced for {etopo_file}")
         contour_df = pd.read_pickle(contour_path)
     else:
-        print(f"Extracting contours from {etopo_file}")
+        print(f"No previous contours. Extracting contours from {etopo_file}")
         etopo_ds = xr.open_dataset(etopo_file)
 
         lat = etopo_ds.lat.data
@@ -424,8 +432,10 @@ def extract_etopo_contours(etopo_file: str | Path) -> None:
         )
 
         contour_df.to_pickle(contour_path)
+        print(f"Saved contours to {contour_path}")
 
     return contour_df
+
 
 def etopo_px_contours(etopo_file: str | Path, zoom: int) -> None:
     if not isinstance(etopo_file, Path):
@@ -452,6 +462,7 @@ def etopo_px_contours(etopo_file: str | Path, zoom: int) -> None:
 
     return etopo_df
 
+
 def wm_to_tile_coords(wm_coords, zoom) -> np.ndarray:
     wm_x = wm_coords[:, 0]
     wm_y = wm_coords[:, 1]
@@ -459,7 +470,7 @@ def wm_to_tile_coords(wm_coords, zoom) -> np.ndarray:
     n_tiles = 2**zoom
 
     px_x = tile_res * n_tiles * (wm_x + wm_radius) / (2 * wm_radius)
-    px_y = tile_res * n_tiles * (wm_radius-wm_y) / (2 * wm_radius)
+    px_y = tile_res * n_tiles * (wm_radius - wm_y) / (2 * wm_radius)
 
     px_coords = np.vstack([px_x.astype(int), px_y.astype(int)]).T
 
@@ -479,7 +490,7 @@ def etopo_grid_coords() -> gpd.GeoDataFrame:
 
     idx_coords = []
     for etopo_file in etopo_files:
-        etopo_idx = get_etopo_idx(etopo_file)
+        etopo_idx = get_etopo_idx(str(etopo_file))
         y_dir = etopo_idx[0]
         x_dir = etopo_idx[3]
         y = int(etopo_idx[1:3])
@@ -580,8 +591,6 @@ def write_onav_tiles(contour_px_df, tile_x, tile_y, zoom):
         cv2.INPAINT_TELEA,
     )
 
-    land_mask = np.flipud(land_mask)
-    tile_img = np.flipud(tile_img)
 
     image_path = f"{TILE_IMG_PATH}onav_{tile_x}_{tile_y}_{zoom}.png"
 
@@ -627,12 +636,14 @@ def process_etopo(etopo_file: str, zoom: int) -> None:
 
     etopo_coords = etopo_grid_coords()
 
-    etopo_file_data = etopo_coords.loc[etopo_coords["etopo_file"] == etopo_file]
+    etopo_file_data = etopo_coords.loc[etopo_coords["etopo_file"] == str(etopo_file)]
     etopo_file_data.geometry = etopo_file_data.transform(
         lambda xy: wm_to_tile_coords(xy, zoom)
     )
 
-    tile_x_min, tile_y_min, tile_x_max, tile_y_max = etopo_file_data.total_bounds / tile_res
+    tile_x_min, tile_y_min, tile_x_max, tile_y_max = (
+        etopo_file_data.total_bounds / tile_res
+    )
 
     tile_x_min = int(np.ceil(tile_x_min))
     tile_y_min = int(np.ceil(tile_y_min))
@@ -648,90 +659,75 @@ def process_etopo(etopo_file: str, zoom: int) -> None:
     if tile_y_max > 2**zoom - 1:
         tile_y_max = 2**zoom - 1
 
-    min_tile_pt = Point(tile_x_min * tile_res, tile_y_min * tile_res)
+    etopo_px_x_min = tile_x_min * tile_res - px_buffer
+    etopo_px_y_min = tile_y_min * tile_res - px_buffer
+    etopo_px_x_max = (tile_x_max + 1) * tile_res + px_buffer
+    etopo_px_y_max = (tile_y_max + 1) * tile_res + px_buffer
 
-    if not min_tile_pt.within(box(*etopo_file_data.total_bounds)):
-        return
+    etopo_pixel_bounds = np.array(
+        [
+            etopo_px_x_min,
+            etopo_px_y_min,
+            etopo_px_x_max,
+            etopo_px_y_max,
+        ]
+    )
 
-    etopo_idx = get_etopo_idx(etopo_file)
-    px_contour_path = f"/data/misc/ETOPO_contours/contour_px_{etopo_idx}_EPSE3857_z{zoom}.pkl"
-    if os.path.exists(px_contour_path):
-        contour_px_df = pd.read_pickle(px_contour_path)
-    else:
-        etopo_px_x_min = tile_x_min * tile_res - px_buffer
-        etopo_px_y_min = tile_y_min * tile_res - px_buffer
-        etopo_px_x_max = (tile_x_max + 1) * tile_res + px_buffer
-        etopo_px_y_max = (tile_y_max + 1) * tile_res + px_buffer
+    etopo_x, etopo_y = etopo_file_data[["x", "y"]].values[0]
 
-        etopo_pixel_bounds = np.array(
-            [
-                etopo_px_x_min,
-                etopo_px_y_min,
-                etopo_px_x_max,
-                etopo_px_y_max,
-            ]
-        )
+    etopo_px_coords = etopo_coords.copy()
+    etopo_px_coords.geometry = etopo_px_coords.transform(
+        lambda xy: wm_to_tile_coords(xy, zoom)
+    )
 
-        etopo_x, etopo_y = etopo_file_data[["x", "y"]].values[0]
+    etopo_df_idx = etopo_px_coords[
+        etopo_px_coords.geometry.intersects(box(*etopo_pixel_bounds))
+    ].index
 
-        etopo_px_coords = etopo_coords.copy()
-        etopo_px_coords.geometry = etopo_px_coords.transform(
-            lambda xy: wm_to_tile_coords(xy, zoom)
-        )
-
-        etopo_df_idx = etopo_px_coords[
-            (etopo_px_coords.x >= etopo_x - 1)
-            & (etopo_px_coords.x <= etopo_x + 1)
+    if etopo_x == 0:
+        wrap_idx = etopo_px_coords.loc[
+            (etopo_px_coords.x == 23)
             & (etopo_px_coords.y >= etopo_y - 1)
             & (etopo_px_coords.y <= etopo_y + 1)
         ].index
 
-        if etopo_x == 0:
-            wrap_idx = etopo_px_coords.loc[
-                (etopo_px_coords.x == 23)
-                & (etopo_px_coords.y >= etopo_y - 1)
-                & (etopo_px_coords.y <= etopo_y + 1)
-            ].index
+        etopo_df_idx = etopo_df_idx.union(wrap_idx)
 
-            etopo_df_idx = etopo_df_idx.union(wrap_idx)
+    elif etopo_x == 23:
+        wrap_idx = etopo_px_coords.loc[
+            (etopo_px_coords.x == 0)
+            & (etopo_px_coords.y >= etopo_y - 1)
+            & (etopo_px_coords.y <= etopo_y + 1)
+        ].index
+        etopo_df_idx = etopo_df_idx.union(wrap_idx)
 
-        elif etopo_x == 23:
-            wrap_idx = etopo_px_coords.loc[
-                (etopo_px_coords.x == 0)
-                & (etopo_px_coords.y >= etopo_y - 1)
-                & (etopo_px_coords.y <= etopo_y + 1)
-            ].index
-            etopo_df_idx = etopo_df_idx.union(wrap_idx)
+    etopo_px_coords = etopo_px_coords.loc[etopo_df_idx]
 
-        etopo_px_coords = etopo_px_coords.loc[etopo_df_idx]
+    etopo_dfs = []
 
-        etopo_dfs = []
+    for _, row in etopo_px_coords.iterrows():
+        etopo_df = etopo_px_contours(row.etopo_file, zoom)
 
-        for _, row in etopo_px_coords.iterrows():
-            etopo_df = etopo_px_contours(row.etopo_file, zoom)
-
-            if etopo_x == 0 and row.x == 23:
-                etopo_df.geometry = etopo_df.translate(
-                    xoff=-(2**zoom) * tile_res
-                ).make_valid(method="structure", keep_collapsed=False)
-            elif etopo_x == 23 and row.x == 0:
-                etopo_df.geometry = etopo_df.translate(
-                    xoff=(2**zoom) * tile_res
-                ).make_valid(method="structure", keep_collapsed=False)
-            etopo_df.geometry = etopo_df.clip(
-                etopo_pixel_bounds
-                + [-2 * tile_res, -2 * tile_res, 2 * tile_res, 2 * tile_res],
-                sort=True,
+        if etopo_x == 0 and row.x == 23:
+            etopo_df.geometry = etopo_df.translate(
+                xoff=-(2**zoom) * tile_res
             ).make_valid(method="structure", keep_collapsed=False)
+        elif etopo_x == 23 and row.x == 0:
+            etopo_df.geometry = etopo_df.translate(
+                xoff=(2**zoom) * tile_res
+            ).make_valid(method="structure", keep_collapsed=False)
+        etopo_df.geometry = etopo_df.clip(
+            etopo_pixel_bounds
+            + [-2 * tile_res, -2 * tile_res, 2 * tile_res, 2 * tile_res],
+            sort=True,
+        ).make_valid(method="structure", keep_collapsed=False)
 
-            if len(etopo_df) > 0:
-                etopo_dfs.append(etopo_df)
-        
-        contour_px_df = pd.concat(etopo_dfs)
+        if len(etopo_df) > 0:
+            etopo_dfs.append(etopo_df)
 
-        contour_px_df = contour_px_df.sort_values(by=["layer_type", "level"])
+    contour_px_df = pd.concat(etopo_dfs)
 
-        contour_px_df.to_pickle(px_contour_path)
+    contour_px_df = contour_px_df.sort_values(by=["layer_type", "level"])
 
     tile_coord_grid = np.meshgrid(
         np.arange(tile_x_min, tile_x_max + 1), np.arange(tile_y_min, tile_y_max + 1)
@@ -785,7 +781,7 @@ def write_tile_blob(x: int, y: int, z: int, blob_data: bytes, mbt_path: str) -> 
             cur.execute("BEGIN IMMEDIATE;")
             cur.execute(
                 "INSERT INTO tiles VALUES (?, ?, ?, ?)",
-                (z, x, y, blob_data),
+                (z, int(y), int(x), blob_data),
             )
             con.commit()
             success = True
@@ -842,7 +838,7 @@ def write_vector_tile(
             cur.execute("BEGIN IMMEDIATE;")
             cur.execute(
                 "INSERT INTO tiles VALUES (?, ?, ?, ?)",
-                (z, x, y, tile_data),
+                (z, int(y), int(x), tile_data),
             )
             con.commit()
             success = True
@@ -884,6 +880,8 @@ sqlite3.register_converter("array", convert_array)
 
 if __name__ == "__main__":
 
+    gdal.SetConfigOption("OGR_INTERLEAVED_READING", "YES")
+
     if not os.path.exists(ONAV_BASEMAP_DB):
         create_mbt_db(ONAV_BASEMAP_DB)
 
@@ -897,18 +895,21 @@ if __name__ == "__main__":
         glob.glob("/data/misc/ETOPO2022/15s/15s_surface_elev_netcdf/*.nc")
     )
 
-    # etopo_files = [
-    #     "/data/misc/ETOPO2022/15s/15s_surface_elev_netcdf/ETOPO_2022_v1_15s_N60W075_surface.nc"
-    # ]
+    etopo_files = [
+        "/data/misc/ETOPO2022/15s/15s_surface_elev_netcdf/ETOPO_2022_v1_15s_N60W075_surface.nc"
+    ]
 
-    # divide OSM files into managable chunks that match etopo bounds
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        executor.map(split_osm_data, etopo_files)
+    # # divide OSM files into managable chunks that match etopo bounds
+    # with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    #     executor.map(split_osm_data, etopo_files)
 
-    # extract contours from etopo and osm data
-    print("Extract ETOPO contours.")
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        executor.map(extract_etopo_contours, etopo_files)
+    # # extract contours from etopo and osm data
+    # print("Extract ETOPO contours.")
+    # with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    #     executor.map(extract_etopo_contours, etopo_files)
+
+    # # for etopo_file in etopo_files:
+    # #     extract_etopo_contours(etopo_file)
 
     # print("Extract pixel/zoom contours.")
     # for etopo_file in etopo_files:
@@ -917,6 +918,6 @@ if __name__ == "__main__":
     #             etopo_px_contours, repeat(etopo_file), range(1, 15)
     #         )
 
-    # for etopo_file in etopo_files:
-    #     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    #         executor.map(process_etopo, repeat(etopo_file), range(1, 15))
+    for etopo_file in etopo_files:
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            executor.map(process_etopo, repeat(etopo_file), range(1, 15))
