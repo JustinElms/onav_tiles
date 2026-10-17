@@ -17,464 +17,89 @@ import mapbox_vector_tile
 import numpy as np
 import pandas as pd
 import pyogrio
+import rasterio
 import xarray as xr
 from osgeo import gdal
+from rasterio.features import rasterize, shapes
 from PIL import Image
-from rasterio import features
+from skimage.morphology import remove_small_objects
 from shapely import (
     box,
-    LineString,
-    Point,
     Polygon,
     MultiPolygon,
 )
 from shapely.affinity import scale
+from shapely.geometry import shape
 
-# gdal.SetConfigOption("OGR_INTERLEAVED_READING", "YES")
-
-MAX_WORKERS = 6
+MAX_WORKERS = 4
 
 ONAV_BASEMAP_DB = "/data/misc/shapes/onav_basemap.mbtiles"
 ONAV_LAND_MASK_DB = "/data/misc/shapes/onav_land_mask.mbtiles"
 ONAV_BATHY_DB = "/data/misc/shapes/onav_bathy.mbtiles"
-OSM_LAND_POLY_PATH = "/data/misc/osm/land-polygons-complete-3857/land_polygons.shp"
 ETOPO_PATH = "/data/misc/ETOPO2022/"
-OSM_PATH = "/data/misc/osm/"
 TILE_IMG_PATH = "/data/misc/shapes/tile_images/"
+
+
+MBT_PATH = "/data/misc/maptiler-osm-2020-02-10-v3.11-planet.mbtiles"
+
+TILE_SIZE = 256
+TILE_BUFFER = 4
+
+MAX_EXTENT = 20037508.342789244
+WORLD_SIZE = MAX_EXTENT * 2
+
+TILE_COLORS = {
+    "land": {
+        0: "f6e8c3",
+        100: "f0deb0",
+        200: "e8d29a",
+        500: "e1c684",
+        1000: "d8b46c",
+        2000: "cd9d50",
+        3000: "c28633",
+        4000: "af7222",
+        5000: "9b5f14",
+        6000: "844c09",
+        8000: "6c3e07",
+        15000: "543005",
+    },
+    "bathy": {
+        -0: "8a8989",
+        -100: "7e7d7d",
+        -200: "737372",
+        -500: "6a6a69",
+        -1000: "626161",
+        -2000: "5a5a5a",
+        -3000: "535352",
+        -4000: "4c4b4b",
+        -5000: "474646",
+        -6000: "414140",
+        -8000: "3c3b3b",
+        -15000: "373737",
+    },
+    "ice": {
+        0: "8683bd",
+        100: "8d89c0",
+        200: "9390c3",
+        500: "9a96c6",
+        1000: "a19eca",
+        2000: "aaa8d0",
+        3000: "b2b2d5",
+        4000: "bcbddc",
+        5000: "c5c6e1",
+        6000: "cfd0e6",
+        8000: "dadaeb",
+        15000: "e2e2ef",
+    },
+}
 
 pc_crs = ccrs.PlateCarree()
 wm_crs = ccrs.epsg("3857")
 
-wm_radius = 20037508.34
-max_zoom = 14
-tile_res = 256
-px_buffer = 8
-
-tile_colors = {
-    "coastline": {
-        0: "f6e8c3",
-    },
-    "land": {
-        0: "f6e8c3",
-        1: "f0deb0",
-        2: "e8d29a",
-        3: "e1c684",
-        4: "d8b46c",
-        5: "cd9d50",
-        6: "c28633",
-        7: "af7222",
-        8: "9b5f14",
-        9: "844c09",
-        10: "6c3e07",
-        11: "543005",
-    },
-    "bathy": {
-        0: "8a8989",
-        1: "7e7d7d",
-        2: "737372",
-        3: "6a6a69",
-        4: "626161",
-        5: "5a5a5a",
-        6: "535352",
-        7: "4c4b4b",
-        8: "474646",
-        9: "414140",
-        10: "3c3b3b",
-        11: "373737",
-    },
-    "ice": {
-        0: "8683bd",
-        1: "8d89c0",
-        2: "9390c3",
-        3: "9a96c6",
-        4: "a19eca",
-        5: "aaa8d0",
-        6: "b2b2d5",
-        7: "bcbddc",
-        8: "c5c6e1",
-        9: "cfd0e6",
-        10: "dadaeb",
-        11: "e2e2ef",
-    },
-}
-
-levels = np.array([100, 200, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 15000])
-
-osm_paths = [
-    "/data/misc/osm/africa-latest.osm.pbf",
-    "/data/misc/osm/antarctica-latest.osm.pbf",
-    "/data/misc/osm/asia-latest.osm.pbf",
-    "/data/misc/osm/australia-oceania-latest.osm.pbf",
-    "/data/misc/osm/central-america-latest.osm.pbf",
-    "/data/misc/osm/europe-latest.osm.pbf",
-    "/data/misc/osm/north-america-latest.osm.pbf",
-    "/data/misc/osm/south-america-latest.osm.pbf",
-]
-
-poly_paths = [
-    "/data/misc/osm/africa.poly",
-    "/data/misc/osm/antarctica.poly",
-    "/data/misc/osm/asia.poly",
-    "/data/misc/osm/australia-oceania.poly",
-    "/data/misc/osm/central-america.poly",
-    "/data/misc/osm/europe.poly",
-    "/data/misc/osm/north-america.poly",
-    "/data/misc/osm/south-america.poly",
-]
-
-
-def find_contours(surface: np.array) -> np.array:
-    levels = np.array([100, 200, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 15000])
-
-    contours = surface.copy()
-    contours[~np.isnan(contours)] = 0
-
-    for idx, level in enumerate(levels[:-1]):
-        contours[surface >= level] = contours[surface >= level] + 1
-
-    return contours
-
-
-def cv2coords(contour: np.array, x_coords: np.array, y_coords: np.array) -> Polygon:
-    coords = np.vstack(
-        [
-            x_coords[
-                contour[:, 0, 1].astype(int),
-                contour[:, 0, 0].astype(int),
-            ],
-            y_coords[
-                contour[:, 0, 1].astype(int),
-                contour[:, 0, 0].astype(int),
-            ],
-        ]
-    ).T
-    return coords
-
-
-def get_contour_polys(contours, x_coords, y_coords, layer_type):
-    contour_df = gpd.GeoDataFrame(
-        columns=["geometry", "level", "layer_type"],
-        geometry="geometry",
-        crs=3857,
-    )
-    for level in range(14):
-        mask = contours.copy()
-        mask[mask != level] = np.nan
-        mask[mask == level] = 1
-        mask[mask != 1] = 0
-        mask[:, 0] = 0
-        mask[:, -1] = 0
-        mask[0, :] = 0
-        mask[-1, :] = 0
-
-        if np.nansum(mask) == 0:
-            continue
-
-        level_contours, hierarchy = cv2.findContours(
-            mask.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        hierarchy = hierarchy[0]
-        level_polys = []
-        for idx, h in enumerate(hierarchy):
-            p_ext, p_previous, p_child, p_parent = h
-            if p_parent == -1:
-                ext = level_contours[idx]
-                holes = []
-                if len(ext) > 4:
-                    ext = cv2coords(ext, x_coords, y_coords)
-                    child_idxs = np.argwhere(hierarchy[:, 3] == idx).flatten()
-                    if len(child_idxs) > 0:
-                        holes = [
-                            cv2coords(level_contours[c], x_coords, y_coords)
-                            for c in child_idxs
-                        ]
-
-                    level_polys.append(Polygon(shell=ext, holes=holes))
-
-        if len(level_polys) > 0:
-            level_df = gpd.GeoDataFrame(
-                {
-                    "geometry": [MultiPolygon(level_polys)],
-                    "level": [level],
-                    "layer_type": [layer_type],
-                },
-                crs=3857,
-            )
-            level_df.geometry = level_df.make_valid(
-                method="structure", keep_collapsed=False
-            )
-            contour_df = pd.concat([contour_df, level_df], ignore_index=True)
-    return contour_df
-
-
-def parse_poly_to_shapely(filepath):
-    coords = []
-    polys = []
-    with open(filepath, "r") as f:
-        lines = f.readlines()
-        for line in lines:
-            line_data = line.split()
-            if len(line_data) == 2:
-                coords.append([float(p) for p in line_data])
-            elif "END" in line and len(coords) > 0:
-                polys.append(Polygon(coords))
-                coords = []
-
-    return MultiPolygon(polys)
-
-
-def split_osm_data(etopo_file) -> None:
-    if not isinstance(etopo_file, Path):
-        etopo_file = Path(etopo_file)
-
-    etopo_ds = xr.open_dataset(etopo_file)
-
-    lat = etopo_ds.lat.data
-    lon = etopo_ds.lon.data
-
-    x0 = int(np.floor(lon.min()))
-    y0 = int(np.floor(lat.min()))
-    x1 = int(np.ceil(lon.max()))
-    y1 = int(np.ceil(lat.max()))
-
-    if x0 < -180:
-        x0 = -180
-    if y0 < -90:
-        y0 = -90
-    if x1 > 180:
-        x1 = 180
-    if y1 > 90:
-        y1 = 90
-
-    etopo_bounds = box(x0, y0, x1, y1)
-
-    for osm_path, poly_path in zip(osm_paths, poly_paths):
-        osm_bounds = parse_poly_to_shapely(poly_path)
-
-        if osm_bounds.intersects(etopo_bounds):
-            bbox_str = f"{x0},{y0},{x1},{y1}"
-            etopo_idx = (
-                "_"
-                + etopo_file.name.split("ETOPO_2022_v1_15s_")[-1].split("_surface.nc")[
-                    0
-                ]
-            )
-            bbox_output_path = osm_path.split(".")[0] + etopo_idx + ".osm.pbf"
-            natural_output_path = (
-                osm_path.split(".")[0] + etopo_idx + "_natural.osm.pbf"
-            )
-
-            if not os.path.exists(bbox_output_path):
-                subprocess.run(
-                    [
-                        "osmium",
-                        "extract",
-                        "-b",
-                        f"{bbox_str}",
-                        f"{osm_path}",
-                        "-o",
-                        f"{bbox_output_path}",
-                        "--strategy",
-                        "complete_ways",
-                    ]
-                )
-            if not os.path.exists(natural_output_path):
-                subprocess.run(
-                    [
-                        "osmium",
-                        "tags-filter",
-                        f"{bbox_output_path}",
-                        "nwr/natural=water",
-                        "nwr/waterway=riverbank",
-                        "-o",
-                        f"{natural_output_path}",
-                    ]
-                )
-
-
-def read_osm_land_polys(wm_bbox: Polygon) -> gpd.GeoDataFrame:
-    land_df = gpd.read_file(
-        "/data/misc/osm/land-polygons-complete-3857/land_polygons.shp",
-        bbox=tuple(wm_bbox.bounds),
-        engine="pyogrio",
-        use_arrow=True,
-    )
-    land_df = land_df.set_geometry(land_df.geometry.intersection(wm_bbox))
-    land_df = land_df[~land_df.geometry.is_empty]
-    land_df.geometry = land_df.make_valid(method="structure", keep_collapsed=False)
-    land_df.drop(columns=["FID"], inplace=True)
-    land_df["level"] = 0
-    land_df["layer_type"] = "coastline"
-    land_df = land_df.dissolve(by=["level", "layer_type"], as_index=False)
-
-    return land_df
-
-
-def osm_water_geoms(tile_id: str) -> gpd.GeoDataFrame:
-    sql_query = """
-        SELECT * FROM multipolygons 
-        WHERE "natural" = 'water' 
-        AND (
-            other_tags LIKE '%"water"=>"river"%'
-            OR other_tags LIKE '%"water"=>"lake"%'
-            OR other_tags LIKE '%"water"=>"pond"%'
-            OR other_tags LIKE '%"water"=>"canal"%'
-        )
-    """
-
-    osm_files = glob.glob(f"/data/misc/osm/*{tile_id}_natural.osm.pbf")
-
-    osm_geoms = []
-    for osm_file in osm_files:
-        temp_df = pyogrio.read_dataframe(
-            osm_file, sql=sql_query, sql_dialect="SQLITE", use_arrow=True
-        )
-        temp_df = temp_df.to_crs(3857)
-        temp_df = temp_df[["geometry"]]
-        temp_df.geometry = temp_df.make_valid(method="structure", keep_collapsed=False)
-        osm_geoms.append(temp_df)
-
-    osm_df = pd.concat(osm_geoms)
-
-    return osm_df
-
-
-def get_coastline_polys(wm_bbox: np.ndarray, tile_id: str) -> gpd.GeoDataFrame:
-    land_df = read_osm_land_polys(wm_bbox)
-
-    if len(land_df) > 0:
-        osm_df = osm_water_geoms(tile_id)
-
-        land_df.geometry = land_df.difference(osm_df)
-
-        if land_df.geom_type[0] != "MultiPolygon":
-            land_df = land_df.explode(ignore_index=True)
-            land_df = land_df[
-                (land_df.geom_type == "Polygon") | (land_df.geom_type == "MultiPolygon")
-            ]
-            land_df = land_df.dissolve()
-
-    return land_df
-
-
-def extract_etopo_contours(etopo_file: str | Path) -> None:
-    print(f"Checking for ETOPO contours for {etopo_file}")
-    if not isinstance(etopo_file, Path):
-        etopo_file = Path(etopo_file)
-
-    etopo_idx = etopo_file.name.split("ETOPO_2022_v1_15s_")[-1].split("_surface.nc")[0]
-
-    contour_path = f"/data/misc/ETOPO_contours/contour_{etopo_idx}.pkl"
-    if os.path.exists(contour_path):
-        print(f"ETOPO contours already produced for {etopo_file}")
-        contour_df = pd.read_pickle(contour_path)
-    else:
-        print(f"No previous contours. Extracting contours from {etopo_file}")
-        etopo_ds = xr.open_dataset(etopo_file)
-
-        lat = etopo_ds.lat.data
-        lon = etopo_ds.lon.data
-
-        lon_grid, lat_grid = np.meshgrid(lon, lat)
-        wm_coords = wm_crs.transform_points(pc_crs, lon_grid, lat_grid)[:, :, :2]
-        wm_x_coords = wm_coords[:, :, 0]
-        wm_y_coords = wm_coords[:, :, 1]
-
-        wm_bbox = box(
-            wm_x_coords.min(), wm_y_coords.min(), wm_x_coords.max(), wm_y_coords.max()
-        )
-
-        coastline_df = get_coastline_polys(wm_bbox, etopo_idx)
-
-        land_contours = find_contours(etopo_ds.z.values)
-        bathy_contours = find_contours(etopo_ds.z.values * -1)
-
-        bed_file = f"/data/misc/ETOPO2022/15s/15s_bed_elev_netcdf/ETOPO_2022_v1_15s_{etopo_idx}_bed.nc"
-        if os.path.exists(bed_file):
-            bed_ds = xr.open_mfdataset(bed_file)
-
-            ice_mask = etopo_ds.z.values - bed_ds.z.values
-            ice_mask[etopo_ds.z.values < 0] = np.nan
-            ice_mask[bed_ds.z.values > etopo_ds.z.values] = np.nan
-            ice_mask[ice_mask < 10] = np.nan
-            ice_mask[~np.isnan(ice_mask)] = 1
-            ice_mask[ice_mask != 1] = 0
-
-            ice_contours = land_contours.copy()
-
-            land_contours[ice_mask == 1] = np.nan
-            ice_contours[ice_mask == 0] = np.nan
-
-            ice_polys = get_contour_polys(ice_contours, wm_x_coords, wm_y_coords, "ice")
-        else:
-            ice_polys = gpd.GeoDataFrame(
-                columns=["geometry", "level", "layer_type"],
-                geometry="geometry",
-                crs=3857,
-            )
-
-        land_polys = get_contour_polys(land_contours, wm_x_coords, wm_y_coords, "land")
-        bathy_polys = get_contour_polys(
-            bathy_contours, wm_x_coords, wm_y_coords, "bathy"
-        )
-
-        contour_df = pd.concat(
-            [bathy_polys, coastline_df, land_polys, ice_polys], ignore_index=True
-        )
-        layer_order = ["bathy", "coastline", "land", "ice"]
-        contour_df["layer_type"] = pd.Categorical(
-            contour_df["layer_type"], categories=layer_order, ordered=True
-        )
-
-        contour_df.geometry = contour_df.make_valid(
-            method="structure", keep_collapsed=False
-        )
-
-        contour_df.to_pickle(contour_path)
-        print(f"Saved contours to {contour_path}")
-
-    return contour_df
-
-
-def etopo_px_contours(etopo_file: str | Path, zoom: int) -> None:
-    if not isinstance(etopo_file, Path):
-        etopo_file = Path(etopo_file)
-
-    etopo_idx = etopo_file.name.split("ETOPO_2022_v1_15s_")[-1].split("_surface.nc")[0]
-
-    px_contour_path = (
-        f"/data/misc/ETOPO_contours/contour_px_{etopo_idx}_EPSE3857_z{zoom}.pkl"
-    )
-
-    if not os.path.exists(px_contour_path):
-
-        etopo_df = extract_etopo_contours(etopo_file)
-
-        etopo_df.geometry = etopo_df.transform(
-            lambda xy: wm_to_tile_coords(xy, zoom)
-        ).make_valid(method="structure", keep_collapsed=False)
-
-        etopo_df.to_pickle(px_contour_path)
-
-    else:
-        etopo_df = pd.read_pickle(px_contour_path)
-
-    return etopo_df
-
-
-def wm_to_tile_coords(wm_coords, zoom) -> np.ndarray:
-    wm_x = wm_coords[:, 0]
-    wm_y = wm_coords[:, 1]
-
-    n_tiles = 2**zoom
-
-    px_x = tile_res * n_tiles * (wm_x + wm_radius) / (2 * wm_radius)
-    px_y = tile_res * n_tiles * (wm_radius - wm_y) / (2 * wm_radius)
-
-    px_coords = np.vstack([px_x.astype(int), px_y.astype(int)]).T
-
-    return np.array(px_coords, dtype=np.float64)
+contour_levels = np.array(
+    [100, 200, 500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 15000]
+)
+contour_levels = np.array([*contour_levels[::-1] * -1, *contour_levels])
 
 
 def get_etopo_idx(etopo_file: str) -> str:
@@ -537,18 +162,329 @@ def etopo_grid_coords() -> gpd.GeoDataFrame:
     )
 
 
-def write_onav_tiles(contour_px_df, tile_x, tile_y, zoom):
-    print(f"Writing tile ({tile_x}, {tile_y}, {zoom}).")
+def query_mbt(x, y, z) -> gpd.GeoDataFrame:
+    query = """
+        SELECT tile_data 
+        FROM tiles 
+        WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?
+    """
+
+    y = 2**z - y - 1
+
+    conn = sqlite3.connect(MBT_PATH)
+    cursor = conn.cursor()
+    cursor.execute(query, (z, x, y))
+    row = cursor.fetchone()
+
+    tile_bytes = row[0]
+
+    decompressed_data = gzip.decompress(tile_bytes)
+    decoded_tile = mapbox_vector_tile.decode(decompressed_data)
+
+    ice_df = None
+    ice_features = decoded_tile.get("landcover")
+    if ice_features is not None:
+        ice_df = gpd.GeoDataFrame.from_features(ice_features["features"])
+        ice_df = ice_df.loc[ice_df["class"] == "ice"]
+        ice_df["class"] = "ice"
+
+    water_df = None
+    water_features = decoded_tile.get("water")
+    if water_features is not None:
+        water_df = gpd.GeoDataFrame.from_features(water_features["features"])
+        water_df["class"] = "water"
+
+    if ice_df is None and water_df is None:
+        tile_df = gpd.GeoDataFrame({"geometry": [], "class": []}, crs=3857)
+    else:
+        tile_df = pd.concat([water_df, ice_df]).explode()
+
+    return tile_df
+
+
+def extract_mbt_data(x, y, z) -> gpd.GeoDataFrame:
+    x_max = 2**z - 1
+
+    tile_df = query_mbt(x, y, z)
+
+    if x == 0:
+        left_tile = query_mbt(x_max, y, z)
+        left_tile.geometry = left_tile.translate(xoff=-4096)
+
+        tile_df = pd.concat([tile_df, left_tile])
+
+    if x == x_max:
+        right_tile = query_mbt(0, y, z)
+        right_tile.geometry = right_tile.translate(xoff=4096)
+
+        tile_df = pd.concat([tile_df, right_tile])
+
+    tile_df.geometry = tile_df.scale(
+        xfact=TILE_SIZE / 4096, yfact=TILE_SIZE / 4096, origin=(0, 0)
+    )
+
+    tile_df = tile_df[["geometry", "class"]].dissolve(by="class").reset_index()
+
+    tile_df.geometry = (
+        tile_df.clip(
+            [
+                -TILE_BUFFER,
+                -TILE_BUFFER,
+                TILE_SIZE + TILE_BUFFER,
+                TILE_SIZE + TILE_BUFFER,
+            ],
+            sort=True,
+        )
+        .translate(xoff=TILE_BUFFER, yoff=TILE_BUFFER)
+        .make_valid(method="structure", keep_collapsed=False)
+    )
+
+    return tile_df
+
+
+def combine_adjacent_by_buffer(geometry_series, dist):
+    """Buffers, merges, and shrinks a group of geometries."""
+    buffered_out = geometry_series.buffer(dist)
+
+    unified = buffered_out.union_all()
+
+    return unified.buffer(-dist)
+
+
+def wm_to_tile_coords(wm_coords, zoom) -> np.ndarray:
+    wm_x = wm_coords[:, 0]
+    wm_y = wm_coords[:, 1]
+
+    n_tiles = 2**zoom
+
+    px_x = TILE_SIZE * n_tiles * (wm_x + MAX_EXTENT) / (2 * MAX_EXTENT)
+    px_y = TILE_SIZE * n_tiles * (MAX_EXTENT - wm_y) / (2 * MAX_EXTENT)
+
+    px_coords = np.vstack([px_x.astype(int), px_y.astype(int)]).T
+
+    return np.array(px_coords, dtype=np.float64)
+
+
+def find_contours(surface: np.array, levels: np.array) -> np.array:
+    contours = surface.copy()
+    contours[~np.isnan(contours)] = np.min(levels)
+
+    for level in levels[:-1]:
+        contours[surface >= level] = level
+
+    return contours
+
+
+def cv2coords(contour: np.array, x_coords: np.array, y_coords: np.array) -> Polygon:
+    coords = np.vstack(
+        [
+            x_coords[
+                contour[:, 0, 1].astype(int),
+                contour[:, 0, 0].astype(int),
+            ],
+            y_coords[
+                contour[:, 0, 1].astype(int),
+                contour[:, 0, 0].astype(int),
+            ],
+        ]
+    ).T
+    return coords
+
+
+def get_contour_polys(contours, x_coords, y_coords, levels):
+    contour_df = gpd.GeoDataFrame(
+        columns=["geometry", "level", "layer_type"],
+        geometry="geometry",
+        crs=3857,
+    )
+    for level in levels:
+        mask = contours.copy()
+        mask[mask != level] = np.nan
+        mask[mask == level] = 1
+        mask[mask != 1] = 0
+        mask[:, 0] = 0
+        mask[:, -1] = 0
+        mask[0, :] = 0
+        mask[-1, :] = 0
+
+        if np.nansum(mask) == 0:
+            continue
+
+        level_contours, hierarchy = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        hierarchy = hierarchy[0]
+        level_polys = []
+        for idx, h in enumerate(hierarchy):
+            p_ext, p_previous, p_child, p_parent = h
+            if p_parent == -1:
+                ext = level_contours[idx]
+                holes = []
+                if len(ext) > 4:
+                    ext = cv2coords(ext, x_coords, y_coords)
+                    child_idxs = np.argwhere(hierarchy[:, 3] == idx).flatten()
+                    if len(child_idxs) > 0:
+                        holes = [
+                            cv2coords(level_contours[c], x_coords, y_coords)
+                            for c in child_idxs
+                        ]
+
+                    level_polys.append(Polygon(shell=ext, holes=holes))
+
+        if len(level_polys) > 0:
+            level_df = gpd.GeoDataFrame(
+                {
+                    "geometry": [MultiPolygon(level_polys)],
+                    "level": [level],
+                },
+                crs=3857,
+            )
+            level_df.geometry = level_df.make_valid(
+                method="structure", keep_collapsed=False
+            )
+            contour_df = pd.concat([contour_df, level_df], ignore_index=True)
+    return contour_df
+
+
+def extract_etopo_contours(etopo_file: str | Path) -> None:
+    if not isinstance(etopo_file, Path):
+        etopo_file = Path(etopo_file)
+
+    etopo_idx = etopo_file.name.split("ETOPO_2022_v1_15s_")[-1].split("_surface.nc")[0]
+
+    contour_path = f"/data/misc/ETOPO_contours/contour_{etopo_idx}.pkl"
+    if os.path.exists(contour_path):
+        # print(f"Contours from {etopo_file} previously processed.")
+        contour_df = pd.read_pickle(contour_path)
+    else:
+        # print(f"Extracting contours from {etopo_file}")
+        etopo_ds = xr.open_dataset(etopo_file).sel(lat=slice(-86, 86))
+
+        lat = etopo_ds.lat.data
+        lon = etopo_ds.lon.data
+
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        wm_coords = wm_crs.transform_points(pc_crs, lon_grid, lat_grid)[:, :, :2]
+        wm_x_coords = wm_coords[:, :, 0]
+        wm_y_coords = wm_coords[:, :, 1]
+
+        contour_mask = find_contours(etopo_ds.z.data, contour_levels)
+        contour_df = get_contour_polys(
+            contour_mask, wm_x_coords, wm_y_coords, contour_levels
+        )
+
+        contour_df.geometry = contour_df.make_valid(
+            method="structure", keep_collapsed=False
+        )
+
+        contour_df.to_pickle(contour_path)
+        # print(f"Saved contours to {contour_path}")
+
+    return contour_df
+
+
+def etopo_px_contours(etopo_file: str | Path, zoom: int) -> None:
+    if not isinstance(etopo_file, Path):
+        etopo_file = Path(etopo_file)
+
+    etopo_idx = etopo_file.name.split("ETOPO_2022_v1_15s_")[-1].split("_surface.nc")[0]
+
+    px_contour_path = Path(
+        f"/data/misc/ETOPO_contours/z{zoom}/contour_px_{etopo_idx}_EPSE3857_z{zoom}.pkl"
+    )
+
+    if not px_contour_path.is_file():
+        # print(f"Processing {px_contour_path}.")
+        px_contour_path.parent.mkdir(parents=True, exist_ok=True)
+
+        etopo_df = extract_etopo_contours(etopo_file)
+
+        etopo_df.geometry = etopo_df.transform(
+            lambda xy: wm_to_tile_coords(xy, zoom)
+        ).make_valid(method="structure", keep_collapsed=False)
+
+        etopo_df.to_pickle(px_contour_path)
+
+    else:
+        etopo_df = pd.read_pickle(px_contour_path)
+        # print(f"{px_contour_path} previously completed.")
+
+    return etopo_df
+
+
+def get_topo_contours(x, y, z) -> gpd.GeoDataFrame:
     tile_px_bounds = np.array(
         [
-            tile_x * tile_res - px_buffer,
-            tile_y * tile_res - px_buffer,
-            (tile_x + 1) * tile_res + px_buffer,
-            (tile_y + 1) * tile_res + px_buffer,
+            x * TILE_SIZE - TILE_BUFFER,
+            y * TILE_SIZE - TILE_BUFFER,
+            (x + 1) * TILE_SIZE + TILE_BUFFER,
+            (y + 1) * TILE_SIZE + TILE_BUFFER,
         ]
     )
 
-    tile_contours = contour_px_df.clip(tile_px_bounds).sort_index()
+    etopo_coords = etopo_grid_coords()
+    etopo_coords.geometry = etopo_coords.transform(lambda xy: wm_to_tile_coords(xy, z))
+
+    tile_topo_df = etopo_coords[
+        etopo_coords.geometry.intersects(
+            box(
+                (x - 1) * TILE_SIZE,
+                (y - 1) * TILE_SIZE,
+                (x + 2) * TILE_SIZE,
+                (y + 2) * TILE_SIZE,
+            )
+        )
+    ]
+
+    tile_topo_df["xoff"] = None
+
+    if tile_topo_df.x.min() == 0:
+        wrap_df = etopo_coords.loc[
+            (etopo_coords.x == 23)
+            & (etopo_coords.y >= tile_topo_df.y.min())
+            & (etopo_coords.y <= tile_topo_df.y.max())
+        ]
+        wrap_df["xoff"] = -1 * (2**z) * TILE_SIZE
+
+        tile_topo_df = pd.concat([tile_topo_df, wrap_df])
+
+    elif tile_topo_df.x.max() == 23:
+        wrap_df = etopo_coords.loc[
+            (etopo_coords.x == 0)
+            & (etopo_coords.y >= tile_topo_df.y.min())
+            & (etopo_coords.y <= tile_topo_df.y.max())
+        ]
+        wrap_df["xoff"] = (2**z) * TILE_SIZE
+        tile_topo_df = pd.concat([tile_topo_df, wrap_df])
+
+    etopo_dfs = []
+    for _, row in tile_topo_df.iterrows():
+        etopo_df = etopo_px_contours(row.etopo_file, z)
+
+        if row.xoff is not None:
+            etopo_df.geometry = etopo_df.translate(xoff=row.xoff).make_valid(
+                method="structure", keep_collapsed=False
+            )
+
+        if len(etopo_df) > 0:
+            etopo_dfs.append(etopo_df)
+
+    combined_df = pd.concat(etopo_dfs)
+
+    grouped_geometry = combined_df.groupby("level")["geometry"].apply(
+        lambda x: combine_adjacent_by_buffer(x, 0.75)
+    )
+
+    contour_px_df = gpd.GeoDataFrame(
+        grouped_geometry, crs=combined_df.crs
+    ).reset_index()
+
+    tile_contours = contour_px_df.explode().reset_index()
+
+    tile_contours = tile_contours[tile_contours.area >= 4]
+
+    tile_contours = tile_contours.clip(tile_px_bounds).sort_index()
     tile_contours.geometry = tile_contours.make_valid(
         method="structure", keep_collapsed=False
     )
@@ -557,31 +493,83 @@ def write_onav_tiles(contour_px_df, tile_x, tile_y, zoom):
         xoff=-tile_px_bounds[0], yoff=-tile_px_bounds[1]
     )
 
-    land_mask = features.rasterize(
-        tile_contours.loc[tile_contours["layer_type"] == "coastline"]
-        .explode()
-        .geometry,
-        out_shape=((tile_res, tile_res)),
-        all_touched=True,
-    )
+    return tile_contours
 
-    tile_img = np.zeros((tile_res, tile_res, 3), dtype=int)
-    for _, row in tile_contours.iterrows():
-        if row.geometry.geom_type == "MultiPolygon":
-            row_geom = row.geometry.geoms
-        else:
-            row_geom = [row.geometry]
-        layer_mask = features.rasterize(
-            row_geom,
-            out_shape=(tile_res, tile_res),
+
+def create_tile_mask(x, y, z) -> np.ndarray:
+
+    mbt_df = extract_mbt_data(x, y, z)
+
+    tile_shape = (TILE_SIZE + 2 * TILE_BUFFER, TILE_SIZE + 2 * TILE_BUFFER)
+
+    ice_mask = None
+    if "ice" in mbt_df["class"].values:
+        ice_mask = rasterize(
+            mbt_df.loc[mbt_df["class"] == "ice"].geometry,
+            out_shape=tile_shape,
             all_touched=True,
         )
-        r, g, b = bytes.fromhex(tile_colors[row.layer_type][row.level])
-        mask_idx = 0
-        if row.layer_type != "bathy":
-            mask_idx = 1
 
-        tile_img[(layer_mask == 1) & (land_mask == mask_idx)] = [r, g, b]
+    water_mask = None
+    if "water" in mbt_df["class"].values:
+        water_mask = rasterize(
+            mbt_df.loc[mbt_df["class"] == "water"].geometry,
+            out_shape=tile_shape,
+            all_touched=True,
+        )
+
+    tile_mask = np.ones(tile_shape)
+
+    if water_mask is not None:
+        tile_mask[water_mask == 1] = 0
+    if ice_mask is not None:
+        tile_mask[ice_mask == 1] = 2
+
+    tile_bounds = mbt_df.total_bounds
+    if y == 0:
+        tile_mask[int(tile_bounds[3]) :, :] = 0
+    elif y == 2**z - 1:
+        tile_mask[: int(tile_bounds[1]), :] = 2
+
+    return np.flipud(tile_mask)
+
+
+def create_tile(x, y, z) -> None:
+    x = int(x)
+    y = int(y)
+    z = int(z)
+
+    print(f"Starting tile ({x}, {y}, {z}).")
+
+    tile_contours = get_topo_contours(x, y, z)
+    tile_mask = create_tile_mask(x, y, z)
+
+    tile_img = np.zeros(
+        (TILE_SIZE + 2 * TILE_BUFFER, TILE_SIZE + 2 * TILE_BUFFER, 3), dtype=int
+    )
+
+    for layer_type, mask_value in zip(["bathy", "land", "ice"], [0, 1, 2]):
+        if ~np.any(tile_mask == mask_value):
+            continue
+
+        for _, row in tile_contours.iterrows():
+            if row.geometry.geom_type == "MultiPolygon":
+                row_geom = row.geometry.geoms
+            else:
+                row_geom = [row.geometry]
+
+            contour_mask = rasterize(
+                row_geom,
+                out_shape=(TILE_SIZE + 2 * TILE_BUFFER, TILE_SIZE + 2 * TILE_BUFFER),
+                all_touched=True,
+            )
+
+            level_color = TILE_COLORS[layer_type].get(row.level)
+            if level_color is None:
+                level_color = TILE_COLORS[layer_type][0]
+
+            r, g, b = bytes.fromhex(level_color)
+            tile_img[(tile_mask == mask_value) & (contour_mask == 1)] = [r, g, b]
 
     tile_img = tile_img.astype(np.uint8)
     tile_img = cv2.inpaint(
@@ -591,179 +579,74 @@ def write_onav_tiles(contour_px_df, tile_x, tile_y, zoom):
         cv2.INPAINT_TELEA,
     )
 
+    water_mask_shapes = shapes(
+        tile_mask,
+        mask=(tile_mask == 0),
+        transform=rasterio.Affine.identity(),
+    )
 
-    image_path = f"{TILE_IMG_PATH}onav_{tile_x}_{tile_y}_{zoom}.png"
+    water_mask_polygons = []
+    for geom, value in water_mask_shapes:
+        water_mask_polygons.append(shape(geom))
+
+    water_mask_contours = gpd.GeoDataFrame(
+        geometry=water_mask_polygons, crs=tile_contours.crs
+    )
+
+    bathy_contours = gpd.overlay(
+        tile_contours.reset_index(drop=True),
+        water_mask_contours.reset_index(drop=True),
+        how="intersection",
+    )
+
+    all_boundaries = bathy_contours.geometry.boundary.union_all()
+    outer_perimeter = box(
+        0, 0, TILE_SIZE + 2 * TILE_BUFFER, TILE_SIZE + 2 * TILE_BUFFER
+    ).boundary
+    internal_borders = all_boundaries.difference(outer_perimeter)
+    cleaned_bathy_contours = gpd.GeoDataFrame(
+        geometry=[internal_borders], crs=bathy_contours.crs
+    )
+
+    bathy_contours.geometry = bathy_contours.translate(
+        xoff=-TILE_BUFFER, yoff=-TILE_BUFFER
+    )
+    bathy_contours.geometry = bathy_contours.geometry.apply(
+        lambda geom: scale(
+            geom,
+            xfact=4096 / TILE_SIZE,
+            yfact=-4096 / TILE_SIZE,
+            origin=(0, 0),
+        )
+    )
+    bathy_contours.geometry = bathy_contours.translate(yoff=4096)
+
+    if len(bathy_contours) > 0:
+        write_vector_tile(
+            y,
+            x,
+            z,
+            bathy_contours.geometry.explode(),
+            ONAV_BATHY_DB,
+        )
+
+    tile_img = tile_img[TILE_BUFFER:-TILE_BUFFER, TILE_BUFFER:-TILE_BUFFER, :]
+    land_mask = tile_mask.copy()
+    land_mask[land_mask == 2] = 1
+    land_mask = land_mask[TILE_BUFFER:-TILE_BUFFER, TILE_BUFFER:-TILE_BUFFER]
+
+    write_tile_blob(y, x, z, land_mask.astype(np.uint8), ONAV_LAND_MASK_DB)
+
+    image_path = f"{TILE_IMG_PATH}onav_{x}_{y}_{z}.png"
 
     img = Image.fromarray(tile_img)
     img.save(image_path)
 
     with open(image_path, "rb") as file:
         image_blob = file.read()
-        write_tile_blob(tile_y, tile_x, zoom, image_blob, ONAV_BASEMAP_DB)
+        write_tile_blob(y, x, z, image_blob, ONAV_BASEMAP_DB)
 
-    write_tile_blob(tile_y, tile_x, zoom, land_mask, ONAV_LAND_MASK_DB)
-
-    bathy_df = tile_contours.loc[
-        (tile_contours.level > 0) & (tile_contours.layer_type == "bathy")
-    ].explode(ignore_index=True)
-    bathy_df = bathy_df[
-        (bathy_df.geom_type == "Polygon") | (bathy_df.geom_type == "MultiPolygon")
-    ]
-
-    bathy_df.geometry = bathy_df.geometry.boundary.buffer(0.5)
-    bathy_df = gpd.GeoDataFrame({"geometry": bathy_df.explode().exterior})
-    bathy_df.geometry = bathy_df.geometry.apply(lambda geom: LineString(geom))
-    bathy_df.geometry = bathy_df.geometry.apply(
-        lambda geom: scale(
-            geom,
-            xfact=4096 / tile_res,
-            yfact=4096 / tile_res,
-            origin=(0, 0),
-        )
-    )
-    if len(bathy_df) > 0:
-        write_vector_tile(
-            tile_y,
-            tile_x,
-            zoom,
-            bathy_df.geometry,
-            ONAV_BATHY_DB,
-        )
-
-
-def process_etopo(etopo_file: str, zoom: int) -> None:
-    print(f"Processing ETOPO file {etopo_file} zoom level {zoom}.")
-
-    etopo_coords = etopo_grid_coords()
-
-    etopo_file_data = etopo_coords.loc[etopo_coords["etopo_file"] == str(etopo_file)]
-    etopo_file_data.geometry = etopo_file_data.transform(
-        lambda xy: wm_to_tile_coords(xy, zoom)
-    )
-
-    tile_x_min, tile_y_min, tile_x_max, tile_y_max = (
-        etopo_file_data.total_bounds / tile_res
-    )
-
-    tile_x_min = int(np.ceil(tile_x_min))
-    tile_y_min = int(np.ceil(tile_y_min))
-    tile_x_max = int(np.ceil(tile_x_max))
-    tile_y_max = int(np.ceil(tile_y_max))
-
-    if tile_x_min < 0:
-        tile_x_min = 0
-    if tile_y_min < 0:
-        tile_y_min = 0
-    if tile_x_max > 2**zoom - 1:
-        tile_x_max = 2**zoom - 1
-    if tile_y_max > 2**zoom - 1:
-        tile_y_max = 2**zoom - 1
-
-    etopo_px_x_min = tile_x_min * tile_res - px_buffer
-    etopo_px_y_min = tile_y_min * tile_res - px_buffer
-    etopo_px_x_max = (tile_x_max + 1) * tile_res + px_buffer
-    etopo_px_y_max = (tile_y_max + 1) * tile_res + px_buffer
-
-    etopo_pixel_bounds = np.array(
-        [
-            etopo_px_x_min,
-            etopo_px_y_min,
-            etopo_px_x_max,
-            etopo_px_y_max,
-        ]
-    )
-
-    etopo_x, etopo_y = etopo_file_data[["x", "y"]].values[0]
-
-    etopo_px_coords = etopo_coords.copy()
-    etopo_px_coords.geometry = etopo_px_coords.transform(
-        lambda xy: wm_to_tile_coords(xy, zoom)
-    )
-
-    etopo_df_idx = etopo_px_coords[
-        etopo_px_coords.geometry.intersects(box(*etopo_pixel_bounds))
-    ].index
-
-    if etopo_x == 0:
-        wrap_idx = etopo_px_coords.loc[
-            (etopo_px_coords.x == 23)
-            & (etopo_px_coords.y >= etopo_y - 1)
-            & (etopo_px_coords.y <= etopo_y + 1)
-        ].index
-
-        etopo_df_idx = etopo_df_idx.union(wrap_idx)
-
-    elif etopo_x == 23:
-        wrap_idx = etopo_px_coords.loc[
-            (etopo_px_coords.x == 0)
-            & (etopo_px_coords.y >= etopo_y - 1)
-            & (etopo_px_coords.y <= etopo_y + 1)
-        ].index
-        etopo_df_idx = etopo_df_idx.union(wrap_idx)
-
-    etopo_px_coords = etopo_px_coords.loc[etopo_df_idx]
-
-    etopo_dfs = []
-
-    for _, row in etopo_px_coords.iterrows():
-        etopo_df = etopo_px_contours(row.etopo_file, zoom)
-
-        if etopo_x == 0 and row.x == 23:
-            etopo_df.geometry = etopo_df.translate(
-                xoff=-(2**zoom) * tile_res
-            ).make_valid(method="structure", keep_collapsed=False)
-        elif etopo_x == 23 and row.x == 0:
-            etopo_df.geometry = etopo_df.translate(
-                xoff=(2**zoom) * tile_res
-            ).make_valid(method="structure", keep_collapsed=False)
-        etopo_df.geometry = etopo_df.clip(
-            etopo_pixel_bounds
-            + [-2 * tile_res, -2 * tile_res, 2 * tile_res, 2 * tile_res],
-            sort=True,
-        ).make_valid(method="structure", keep_collapsed=False)
-
-        if len(etopo_df) > 0:
-            etopo_dfs.append(etopo_df)
-
-    contour_px_df = pd.concat(etopo_dfs)
-
-    contour_px_df = contour_px_df.sort_values(by=["layer_type", "level"])
-
-    tile_coord_grid = np.meshgrid(
-        np.arange(tile_x_min, tile_x_max + 1), np.arange(tile_y_min, tile_y_max + 1)
-    )
-    tile_coords = np.array(tile_coord_grid).T.reshape(-1, 2)
-
-    tile_x_coords = tile_coords[:, 0]
-    tile_y_coords = tile_coords[:, 1]
-
-    with ThreadPoolExecutor() as executor:
-        executor.map(
-            write_onav_tiles,
-            repeat(contour_px_df),
-            tile_x_coords,
-            tile_y_coords,
-            repeat(zoom),
-        )
-
-
-def create_mbt_db(name: str) -> None:
-
-    con = sqlite3.connect(name)
-    cur = con.cursor()
-
-    cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA synchronous=NORMAL;")
-
-    init_statements = [
-        "CREATE TABLE metadata (name text, value text);",
-        "CREATE TABLE tiles (zoom_level integer, tile_column integer, tile_row integer, tile_data blob);",
-        "CREATE UNIQUE INDEX name on metadata (name);",
-        "CREATE UNIQUE INDEX tile_index on tiles (zoom_level, tile_column, tile_row);",
-    ]
-    for stmt in init_statements:
-        cur.execute(stmt)
-    con.close()
+    print(f"Completed tiles ({x}, {y}, {z}).")
 
 
 def write_tile_blob(x: int, y: int, z: int, blob_data: bytes, mbt_path: str) -> None:
@@ -795,8 +678,8 @@ def write_tile_blob(x: int, y: int, z: int, blob_data: bytes, mbt_path: str) -> 
                 time.sleep(sleep_time)
             else:
                 con.rollback()
-                print(e)
-                print(f"Unable to save tile ({x}, {y}, {z}) to {mbt_path}")
+                # print(e)
+                # print(f"Unable to save tile ({x}, {y}, {z}) to {mbt_path}")
                 return
         finally:
             if attempt == max_retries or success:
@@ -852,8 +735,8 @@ def write_vector_tile(
                 time.sleep(sleep_time)
             else:
                 con.rollback()
-                print(e)
-                print(f"Unable to save tile ({x}, {y}, {z}) to {mbt_path}")
+                # print(e)
+                # print(f"Unable to save tile ({x}, {y}, {z}) to {mbt_path}")
                 return
         finally:
             if attempt == max_retries or success:
@@ -875,11 +758,102 @@ def convert_array(blob):
     return np.load(out)
 
 
+def create_mbt_db(name: str) -> None:
+
+    con = sqlite3.connect(name)
+    cur = con.cursor()
+
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
+
+    init_statements = [
+        "CREATE TABLE metadata (name text, value text);",
+        "CREATE TABLE tiles (zoom_level integer, tile_column integer, tile_row integer, tile_data blob);",
+        "CREATE UNIQUE INDEX name on metadata (name);",
+        "CREATE UNIQUE INDEX tile_index on tiles (zoom_level, tile_column, tile_row);",
+    ]
+    for stmt in init_statements:
+        cur.execute(stmt)
+    con.close()
+
+
+def process_tiles(z) -> None:
+    n_tiles = 2**z
+
+    tile_x, tile_y = np.meshgrid(range(n_tiles), range(n_tiles))
+
+    tile_idxs = np.stack(
+        [tile_x.ravel(), tile_y.ravel(), np.repeat(z, n_tiles**2)]
+    ).T.astype(np.int_)
+
+    print(tile_idxs.shape, (2**z) ** 2)
+    tile_groups = np.array_split(tile_idxs, MAX_WORKERS)
+
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(process_tile_group, tile_group)
+            for tile_group in tile_groups
+        ]
+        for future in futures:
+            if future.exception():
+                print(f"A task crashed with error: {future.exception()}")
+
+    # for tile_group in tile_groups:
+    #     process_tile_group(tile_group)
+
+
+def process_tile_group(tile_group):
+
+    filtered_group = filter_tile_group(tile_group)
+    # for x, y, z in filtered_group:
+    #     create_tile(x, y, z)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(create_tile, x, y, z) for x, y, z in filtered_group]
+        for future in futures:
+            if future.exception():
+                print(f"A task crashed with error: {future.exception()}")
+
+
+def filter_tile_group(tile_group):
+    x = tile_group[:, 0]
+    y = tile_group[:, 1]
+    z = tile_group[:, 2]
+
+    x_min = int(x.min())
+    x_max = int(x.max())
+    y_min = int(y.min())
+    y_max = int(y.max())
+
+    zoom = z[0]
+
+    try:
+        connection = sqlite3.connect(ONAV_BASEMAP_DB)
+        selector = connection.cursor()
+        sqlite = (
+            f"SELECT tile_column, tile_row FROM tiles WHERE zoom_level = {zoom} "
+            f"AND tile_column >= {x_min} "
+            f"AND tile_column <= {x_max} "
+            f"AND tile_row >= {y_min} "
+            f"AND tile_row <= {y_max}"
+        )
+        selector.execute(sqlite)
+        tile_coords = np.array(selector.fetchall())
+
+        mask = (tile_group[:, None, :2] == tile_coords).all(axis=2).any(axis=1)
+
+        filtered = tile_group[~mask]
+
+    except Exception as e:
+        print(e)
+        filtered = tile_group
+
+    return filtered
+
+
 sqlite3.register_adapter(np.ndarray, adapt_array)
 sqlite3.register_converter("array", convert_array)
 
 if __name__ == "__main__":
-
     gdal.SetConfigOption("OGR_INTERLEAVED_READING", "YES")
 
     if not os.path.exists(ONAV_BASEMAP_DB):
@@ -895,29 +869,17 @@ if __name__ == "__main__":
         glob.glob("/data/misc/ETOPO2022/15s/15s_surface_elev_netcdf/*.nc")
     )
 
-    etopo_files = [
-        "/data/misc/ETOPO2022/15s/15s_surface_elev_netcdf/ETOPO_2022_v1_15s_N60W075_surface.nc"
-    ]
-
-    # # divide OSM files into managable chunks that match etopo bounds
-    # with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    #     executor.map(split_osm_data, etopo_files)
-
-    # # extract contours from etopo and osm data
-    # print("Extract ETOPO contours.")
     # with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
     #     executor.map(extract_etopo_contours, etopo_files)
 
-    # # for etopo_file in etopo_files:
-    # #     extract_etopo_contours(etopo_file)
-
-    # print("Extract pixel/zoom contours.")
     # for etopo_file in etopo_files:
     #     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    #         executor.map(
-    #             etopo_px_contours, repeat(etopo_file), range(1, 15)
-    #         )
+    #         executor.map(etopo_px_contours, repeat(etopo_file), range(1, 15))
 
-    for etopo_file in etopo_files:
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            executor.map(process_etopo, repeat(etopo_file), range(1, 15))
+    for z in range(5, 11):
+        process_tiles(z)
+    # process_tiles()
+
+    # for x in range(2**5):
+    #     for y in range(2**5):
+    #         create_tile(x, y, 5)
