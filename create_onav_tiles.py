@@ -1,13 +1,15 @@
+import gc
 import glob
 import gzip
 import io
+import multiprocessing as mp
 import os
 import random
 import sqlite3
-import subprocess
 import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from itertools import product, repeat
+import warnings
+from concurrent.futures import ProcessPoolExecutor
+from itertools import islice, product, repeat
 from pathlib import Path
 
 import cartopy.crs as ccrs
@@ -16,34 +18,42 @@ import geopandas as gpd
 import mapbox_vector_tile
 import numpy as np
 import pandas as pd
-import pyogrio
 import rasterio
 import xarray as xr
 from osgeo import gdal
+from rasterio.errors import ShapeSkipWarning
 from rasterio.features import rasterize, shapes
 from PIL import Image
-from skimage.morphology import remove_small_objects
 from shapely import (
     box,
     Polygon,
+    make_valid,
     MultiPolygon,
 )
 from shapely.affinity import scale
 from shapely.geometry import shape
+from shapely.ops import unary_union
 
-MAX_WORKERS = 4
+pd.options.mode.chained_assignment = None
+warnings.filterwarnings("ignore", category=ShapeSkipWarning)
+
+gdal.UseExceptions()
+gdal.PushErrorHandler("CPLQuietErrorHandler")
+
+MAX_WORKERS = 6
 
 ONAV_BASEMAP_DB = "/data/misc/shapes/onav_basemap.mbtiles"
 ONAV_LAND_MASK_DB = "/data/misc/shapes/onav_land_mask.mbtiles"
 ONAV_BATHY_DB = "/data/misc/shapes/onav_bathy.mbtiles"
 ETOPO_PATH = "/data/misc/ETOPO2022/"
+VRT_PATH = "/data/misc/etopo_global.vrt"
 TILE_IMG_PATH = "/data/misc/shapes/tile_images/"
-
 
 MBT_PATH = "/data/misc/maptiler-osm-2020-02-10-v3.11-planet.mbtiles"
 
 TILE_SIZE = 256
 TILE_BUFFER = 4
+BUFFERED_SIZE = TILE_SIZE + (TILE_BUFFER * 2)
 
 MAX_EXTENT = 20037508.342789244
 WORLD_SIZE = MAX_EXTENT * 2
@@ -102,66 +112,6 @@ contour_levels = np.array(
 contour_levels = np.array([*contour_levels[::-1] * -1, *contour_levels])
 
 
-def get_etopo_idx(etopo_file: str) -> str:
-    etopo_idx = etopo_file.split("ETOPO_2022_v1_15s_")[-1].split("_surface.nc")[0]
-
-    return etopo_idx
-
-
-def etopo_grid_coords() -> gpd.GeoDataFrame:
-    etopo_files = sorted(
-        glob.glob("/data/misc/ETOPO2022/15s/15s_surface_elev_netcdf/*.nc")
-    )
-
-    idx_coords = []
-    for etopo_file in etopo_files:
-        etopo_idx = get_etopo_idx(str(etopo_file))
-        y_dir = etopo_idx[0]
-        x_dir = etopo_idx[3]
-        y = int(etopo_idx[1:3])
-        x = int(etopo_idx[4:])
-
-        if y_dir == "N":
-            lat_max = int(y)
-            y = y + 90
-        else:
-            lat_max = -int(y)
-            y = 90 - y
-
-        lat_min = lat_max - 15
-
-        y_idx = int((180 - y) / 15)
-
-        if x_dir == "W":
-            lon_min = -int(x)
-            x = x + 180
-        else:
-            lon_min = int(x)
-            x = 180 - x
-
-        lon_max = lon_min + 15
-
-        x_idx = int((360 - x) / 15)
-
-        wm_bound_coords = wm_crs.transform_points(
-            pc_crs, np.array([lon_min, lon_max]), np.array([lat_min, lat_max])
-        )
-
-        wm_bbox = box(
-            wm_bound_coords[0, 0],
-            wm_bound_coords[0, 1],
-            wm_bound_coords[1, 0],
-            wm_bound_coords[1, 1],
-        )
-
-        idx_coords.append([etopo_file, etopo_idx, x_idx, y_idx, wm_bbox])
-
-    return gpd.GeoDataFrame(
-        idx_coords,
-        columns=["etopo_file", "etopo_idx", "x", "y", "geometry"],
-    )
-
-
 def query_mbt(x, y, z) -> gpd.GeoDataFrame:
     query = """
         SELECT tile_data 
@@ -176,29 +126,39 @@ def query_mbt(x, y, z) -> gpd.GeoDataFrame:
     cursor.execute(query, (z, x, y))
     row = cursor.fetchone()
 
-    tile_bytes = row[0]
+    if row is None:
+        return gpd.GeoDataFrame({"geometry": [], "class": []}, crs=3857)
 
-    decompressed_data = gzip.decompress(tile_bytes)
+    decompressed_data = gzip.decompress(row[0])
     decoded_tile = mapbox_vector_tile.decode(decompressed_data)
 
-    ice_df = None
+    del decompressed_data
+    del row
+
+    dfs = []
+
     ice_features = decoded_tile.get("landcover")
-    if ice_features is not None:
-        ice_df = gpd.GeoDataFrame.from_features(ice_features["features"])
-        ice_df = ice_df.loc[ice_df["class"] == "ice"]
-        ice_df["class"] = "ice"
+    if ice_features:
+        filtered_ice = [
+            f
+            for f in ice_features["features"]
+            if f.get("properties", {}).get("class") == "ice"
+        ]
+        if filtered_ice:
+            df = gpd.GeoDataFrame.from_features(filtered_ice, crs=3857)
+            df["class"] = "ice"
+            dfs.append(df)
 
-    water_df = None
     water_features = decoded_tile.get("water")
-    if water_features is not None:
-        water_df = gpd.GeoDataFrame.from_features(water_features["features"])
-        water_df["class"] = "water"
+    if water_features and water_features["features"]:
+        df = gpd.GeoDataFrame.from_features(water_features["features"], crs=3857)
+        df["class"] = "water"
+        dfs.append(df)
 
-    if ice_df is None and water_df is None:
-        tile_df = gpd.GeoDataFrame({"geometry": [], "class": []}, crs=3857)
-    else:
-        tile_df = pd.concat([water_df, ice_df]).explode()
+    if not dfs:
+        return gpd.GeoDataFrame({"geometry": [], "class": []}, crs=3857)
 
+    tile_df = pd.concat(dfs, ignore_index=True).explode(ignore_index=True)
     return tile_df
 
 
@@ -207,37 +167,52 @@ def extract_mbt_data(x, y, z) -> gpd.GeoDataFrame:
 
     tile_df = query_mbt(x, y, z)
 
+    if len(tile_df) == 0:
+        return tile_df
+
     if x == 0:
         left_tile = query_mbt(x_max, y, z)
         left_tile.geometry = left_tile.translate(xoff=-4096)
-
         tile_df = pd.concat([tile_df, left_tile])
 
     if x == x_max:
         right_tile = query_mbt(0, y, z)
         right_tile.geometry = right_tile.translate(xoff=4096)
-
         tile_df = pd.concat([tile_df, right_tile])
 
     tile_df.geometry = tile_df.scale(
         xfact=TILE_SIZE / 4096, yfact=TILE_SIZE / 4096, origin=(0, 0)
     )
 
-    tile_df = tile_df[["geometry", "class"]].dissolve(by="class").reset_index()
-
-    tile_df.geometry = (
-        tile_df.clip(
-            [
-                -TILE_BUFFER,
-                -TILE_BUFFER,
-                TILE_SIZE + TILE_BUFFER,
-                TILE_SIZE + TILE_BUFFER,
-            ],
-            sort=True,
+    invalid_idx = tile_df.loc[~tile_df.is_valid].index
+    for idx in invalid_idx:
+        tile_df.loc[idx, "geometry"] = make_valid(
+            tile_df.loc[idx, "geometry"], method="structure", keep_collapsed=False
         )
-        .translate(xoff=TILE_BUFFER, yoff=TILE_BUFFER)
-        .make_valid(method="structure", keep_collapsed=False)
-    )
+
+    def optimize_geometries(df):
+        optimized_rows = []
+        for geom_class, group in df.groupby("class"):
+            unionized = unary_union(group.geometry.values)
+            optimized_rows.append({"class": geom_class, "geometry": unionized})
+        return gpd.GeoDataFrame(optimized_rows, crs=3857)
+
+    tile_df = optimize_geometries(tile_df)
+
+    tile_df.geometry = tile_df.intersection(
+        box(
+            -TILE_BUFFER,
+            -TILE_BUFFER,
+            TILE_SIZE + TILE_BUFFER,
+            TILE_SIZE + TILE_BUFFER,
+        ),
+    ).translate(xoff=TILE_BUFFER, yoff=TILE_BUFFER)
+
+    invalid_idx = tile_df.loc[~tile_df.is_valid].index
+    for idx in invalid_idx:
+        tile_df.loc[idx, "geometry"] = make_valid(
+            tile_df.loc[idx, "geometry"], method="structure", keep_collapsed=False
+        )
 
     return tile_df
 
@@ -321,7 +296,7 @@ def get_contour_polys(contours, x_coords, y_coords, levels):
             if p_parent == -1:
                 ext = level_contours[idx]
                 holes = []
-                if len(ext) > 4:
+                if len(ext) >= 4:
                     ext = cv2coords(ext, x_coords, y_coords)
                     child_idxs = np.argwhere(hierarchy[:, 3] == idx).flatten()
                     if len(child_idxs) > 0:
@@ -355,10 +330,8 @@ def extract_etopo_contours(etopo_file: str | Path) -> None:
 
     contour_path = f"/data/misc/ETOPO_contours/contour_{etopo_idx}.pkl"
     if os.path.exists(contour_path):
-        # print(f"Contours from {etopo_file} previously processed.")
         contour_df = pd.read_pickle(contour_path)
     else:
-        # print(f"Extracting contours from {etopo_file}")
         etopo_ds = xr.open_dataset(etopo_file).sel(lat=slice(-86, 86))
 
         lat = etopo_ds.lat.data
@@ -379,7 +352,6 @@ def extract_etopo_contours(etopo_file: str | Path) -> None:
         )
 
         contour_df.to_pickle(contour_path)
-        # print(f"Saved contours to {contour_path}")
 
     return contour_df
 
@@ -395,7 +367,6 @@ def etopo_px_contours(etopo_file: str | Path, zoom: int) -> None:
     )
 
     if not px_contour_path.is_file():
-        # print(f"Processing {px_contour_path}.")
         px_contour_path.parent.mkdir(parents=True, exist_ok=True)
 
         etopo_df = extract_etopo_contours(etopo_file)
@@ -408,92 +379,8 @@ def etopo_px_contours(etopo_file: str | Path, zoom: int) -> None:
 
     else:
         etopo_df = pd.read_pickle(px_contour_path)
-        # print(f"{px_contour_path} previously completed.")
 
     return etopo_df
-
-
-def get_topo_contours(x, y, z) -> gpd.GeoDataFrame:
-    tile_px_bounds = np.array(
-        [
-            x * TILE_SIZE - TILE_BUFFER,
-            y * TILE_SIZE - TILE_BUFFER,
-            (x + 1) * TILE_SIZE + TILE_BUFFER,
-            (y + 1) * TILE_SIZE + TILE_BUFFER,
-        ]
-    )
-
-    etopo_coords = etopo_grid_coords()
-    etopo_coords.geometry = etopo_coords.transform(lambda xy: wm_to_tile_coords(xy, z))
-
-    tile_topo_df = etopo_coords[
-        etopo_coords.geometry.intersects(
-            box(
-                (x - 1) * TILE_SIZE,
-                (y - 1) * TILE_SIZE,
-                (x + 2) * TILE_SIZE,
-                (y + 2) * TILE_SIZE,
-            )
-        )
-    ]
-
-    tile_topo_df["xoff"] = None
-
-    if tile_topo_df.x.min() == 0:
-        wrap_df = etopo_coords.loc[
-            (etopo_coords.x == 23)
-            & (etopo_coords.y >= tile_topo_df.y.min())
-            & (etopo_coords.y <= tile_topo_df.y.max())
-        ]
-        wrap_df["xoff"] = -1 * (2**z) * TILE_SIZE
-
-        tile_topo_df = pd.concat([tile_topo_df, wrap_df])
-
-    elif tile_topo_df.x.max() == 23:
-        wrap_df = etopo_coords.loc[
-            (etopo_coords.x == 0)
-            & (etopo_coords.y >= tile_topo_df.y.min())
-            & (etopo_coords.y <= tile_topo_df.y.max())
-        ]
-        wrap_df["xoff"] = (2**z) * TILE_SIZE
-        tile_topo_df = pd.concat([tile_topo_df, wrap_df])
-
-    etopo_dfs = []
-    for _, row in tile_topo_df.iterrows():
-        etopo_df = etopo_px_contours(row.etopo_file, z)
-
-        if row.xoff is not None:
-            etopo_df.geometry = etopo_df.translate(xoff=row.xoff).make_valid(
-                method="structure", keep_collapsed=False
-            )
-
-        if len(etopo_df) > 0:
-            etopo_dfs.append(etopo_df)
-
-    combined_df = pd.concat(etopo_dfs)
-
-    grouped_geometry = combined_df.groupby("level")["geometry"].apply(
-        lambda x: combine_adjacent_by_buffer(x, 0.75)
-    )
-
-    contour_px_df = gpd.GeoDataFrame(
-        grouped_geometry, crs=combined_df.crs
-    ).reset_index()
-
-    tile_contours = contour_px_df.explode().reset_index()
-
-    tile_contours = tile_contours[tile_contours.area >= 4]
-
-    tile_contours = tile_contours.clip(tile_px_bounds).sort_index()
-    tile_contours.geometry = tile_contours.make_valid(
-        method="structure", keep_collapsed=False
-    )
-
-    tile_contours.geometry = tile_contours.translate(
-        xoff=-tile_px_bounds[0], yoff=-tile_px_bounds[1]
-    )
-
-    return tile_contours
 
 
 def create_tile_mask(x, y, z) -> np.ndarray:
@@ -502,36 +389,122 @@ def create_tile_mask(x, y, z) -> np.ndarray:
 
     tile_shape = (TILE_SIZE + 2 * TILE_BUFFER, TILE_SIZE + 2 * TILE_BUFFER)
 
-    ice_mask = None
-    if "ice" in mbt_df["class"].values:
-        ice_mask = rasterize(
-            mbt_df.loc[mbt_df["class"] == "ice"].geometry,
-            out_shape=tile_shape,
-            all_touched=True,
-        )
-
-    water_mask = None
-    if "water" in mbt_df["class"].values:
-        water_mask = rasterize(
-            mbt_df.loc[mbt_df["class"] == "water"].geometry,
-            out_shape=tile_shape,
-            all_touched=True,
-        )
-
     tile_mask = np.ones(tile_shape)
 
-    if water_mask is not None:
-        tile_mask[water_mask == 1] = 0
-    if ice_mask is not None:
-        tile_mask[ice_mask == 1] = 2
+    if len(mbt_df) > 0:
+        ice_mask = None
+        if "ice" in mbt_df["class"].values:
+            ice_mask = rasterize(
+                mbt_df.loc[mbt_df["class"] == "ice"].geometry,
+                out_shape=tile_shape,
+                all_touched=True,
+            )
 
-    tile_bounds = mbt_df.total_bounds
-    if y == 0:
-        tile_mask[int(tile_bounds[3]) :, :] = 0
-    elif y == 2**z - 1:
-        tile_mask[: int(tile_bounds[1]), :] = 2
+        water_mask = None
+        if "water" in mbt_df["class"].values:
+            water_mask = rasterize(
+                mbt_df.loc[mbt_df["class"] == "water"].geometry,
+                out_shape=tile_shape,
+                all_touched=True,
+            )
+
+        if water_mask is not None:
+            tile_mask[water_mask == 1] = 0
+        if ice_mask is not None:
+            tile_mask[ice_mask == 1] = 2
+
+        tile_bounds = mbt_df.total_bounds
+        if y == 0:
+            tile_mask[int(tile_bounds[3]) :, :] = 0
+        elif y == 2**z - 1:
+            tile_mask[: int(tile_bounds[1]), :] = 2
 
     return np.flipud(tile_mask)
+
+
+def create_vrt():
+    if os.path.exists(VRT_PATH):
+        return
+
+    all_nc_files = glob.glob("/data/misc/ETOPO2022/15s/15s_surface_elev_netcdf/*.nc")
+    subdatasets = [f'NETCDF:"{f}":z' for f in all_nc_files]
+
+    vrt_ds = gdal.BuildVRT(VRT_PATH, subdatasets)
+
+    if vrt_ds is not None:
+        vrt_ds.FlushCache()
+        vrt_ds = None
+    else:
+        print("GDAL failed to initialize the VRT dataset mapping.")
+
+
+def get_topo_contours(x, y, z):
+    n_tiles = 2**z
+    tile_width = (MAX_EXTENT * 2) / n_tiles
+    pixel_resolution = tile_width / TILE_SIZE
+
+    left = -MAX_EXTENT + (x * tile_width)
+    top = MAX_EXTENT - (y * tile_width)
+    right = left + tile_width
+    bottom = top - tile_width
+
+    buf_meters = TILE_BUFFER * pixel_resolution
+    b_left, b_bottom, b_right, b_top = (
+        left - buf_meters,
+        bottom - buf_meters,
+        right + buf_meters,
+        top + buf_meters,
+    )
+
+    c_left = max(b_left, -MAX_EXTENT)
+    c_bottom = max(b_bottom, -MAX_EXTENT)
+    c_right = min(b_right, MAX_EXTENT)
+    c_top = min(b_top, MAX_EXTENT)
+
+    pad_left = int(round((c_left - b_left) / pixel_resolution))
+    pad_right = int(round((b_right - c_right) / pixel_resolution))
+    pad_bottom = int(round((c_bottom - b_bottom) / pixel_resolution))
+    pad_top = int(round((b_top - c_top) / pixel_resolution))
+
+    warp_width = BUFFERED_SIZE - pad_left - pad_right
+    warp_height = BUFFERED_SIZE - pad_top - pad_bottom
+
+    gdal.SetConfigOption("GDAL_HTTP_UNSUB_OK", "YES")
+
+    try:
+        ds = gdal.Warp(
+            "",
+            VRT_PATH,
+            format="MEM",
+            dstSRS="EPSG:3857",
+            resampleAlg=gdal.GRIORA_Bilinear,
+            outputBounds=[c_left, c_bottom, c_right, c_top],
+            width=warp_width,
+            height=warp_height,
+        )
+
+        band = ds.GetRasterBand(1)
+        tile_data = band.ReadAsArray()
+        ds = None
+
+        padded_tile_data = np.pad(
+            tile_data,
+            ((pad_top, pad_bottom), (pad_left, pad_right)),
+            mode="constant",
+            constant_values=-32768,
+        )
+
+        contour_mask = padded_tile_data.copy()
+
+        for l0, l1 in zip(contour_levels[:-1], contour_levels[1:]):
+            contour_mask[(contour_mask >= l0) & (contour_mask < l1)] = l0
+
+    except Exception as e:
+        print(f"Error rendering edge tile {z}/{x}/{y}: {e}")
+    finally:
+        gdal.SetConfigOption("GDAL_HTTP_UNSUB_OK", None)
+
+    return contour_mask
 
 
 def create_tile(x, y, z) -> None:
@@ -540,9 +513,19 @@ def create_tile(x, y, z) -> None:
     z = int(z)
 
     print(f"Starting tile ({x}, {y}, {z}).")
-
-    tile_contours = get_topo_contours(x, y, z)
     tile_mask = create_tile_mask(x, y, z)
+
+    contour_mask = get_topo_contours(x, y, z)
+    x_max = 2**z - 1
+    if x == 0:
+        wrap_contours = get_topo_contours(x_max, y, z)
+        contour_mask[:, :TILE_BUFFER] = wrap_contours[
+            :, -TILE_BUFFER * 2 : -TILE_BUFFER
+        ]
+
+    if x == x_max:
+        wrap_contours = get_topo_contours(0, y, z)
+        contour_mask[:, -TILE_BUFFER:] = wrap_contours[:, TILE_BUFFER : TILE_BUFFER * 2]
 
     tile_img = np.zeros(
         (TILE_SIZE + 2 * TILE_BUFFER, TILE_SIZE + 2 * TILE_BUFFER, 3), dtype=int
@@ -552,24 +535,13 @@ def create_tile(x, y, z) -> None:
         if ~np.any(tile_mask == mask_value):
             continue
 
-        for _, row in tile_contours.iterrows():
-            if row.geometry.geom_type == "MultiPolygon":
-                row_geom = row.geometry.geoms
-            else:
-                row_geom = [row.geometry]
-
-            contour_mask = rasterize(
-                row_geom,
-                out_shape=(TILE_SIZE + 2 * TILE_BUFFER, TILE_SIZE + 2 * TILE_BUFFER),
-                all_touched=True,
-            )
-
-            level_color = TILE_COLORS[layer_type].get(row.level)
+        for level in contour_levels:
+            level_color = TILE_COLORS[layer_type].get(level)
             if level_color is None:
                 level_color = TILE_COLORS[layer_type][0]
 
             r, g, b = bytes.fromhex(level_color)
-            tile_img[(tile_mask == mask_value) & (contour_mask == 1)] = [r, g, b]
+            tile_img[(tile_mask == mask_value) & (contour_mask == level)] = [r, g, b]
 
     tile_img = tile_img.astype(np.uint8)
     tile_img = cv2.inpaint(
@@ -579,8 +551,18 @@ def create_tile(x, y, z) -> None:
         cv2.INPAINT_TELEA,
     )
 
+    land_mask = tile_mask.copy()
+
+    contour_mask[tile_mask != 0] = np.nan
+
     water_mask_shapes = shapes(
         tile_mask,
+        mask=(tile_mask == 0),
+        transform=rasterio.Affine.identity(),
+    )
+
+    water_mask_shapes = shapes(
+        contour_mask,
         mask=(tile_mask == 0),
         transform=rasterio.Affine.identity(),
     )
@@ -589,22 +571,14 @@ def create_tile(x, y, z) -> None:
     for geom, value in water_mask_shapes:
         water_mask_polygons.append(shape(geom))
 
-    water_mask_contours = gpd.GeoDataFrame(
-        geometry=water_mask_polygons, crs=tile_contours.crs
-    )
-
-    bathy_contours = gpd.overlay(
-        tile_contours.reset_index(drop=True),
-        water_mask_contours.reset_index(drop=True),
-        how="intersection",
-    )
+    bathy_contours = gpd.GeoDataFrame(geometry=water_mask_polygons, crs=3857)
 
     all_boundaries = bathy_contours.geometry.boundary.union_all()
     outer_perimeter = box(
         0, 0, TILE_SIZE + 2 * TILE_BUFFER, TILE_SIZE + 2 * TILE_BUFFER
     ).boundary
     internal_borders = all_boundaries.difference(outer_perimeter)
-    cleaned_bathy_contours = gpd.GeoDataFrame(
+    bathy_contours = gpd.GeoDataFrame(
         geometry=[internal_borders], crs=bathy_contours.crs
     )
 
@@ -630,10 +604,9 @@ def create_tile(x, y, z) -> None:
             ONAV_BATHY_DB,
         )
 
-    tile_img = tile_img[TILE_BUFFER:-TILE_BUFFER, TILE_BUFFER:-TILE_BUFFER, :]
-    land_mask = tile_mask.copy()
     land_mask[land_mask == 2] = 1
     land_mask = land_mask[TILE_BUFFER:-TILE_BUFFER, TILE_BUFFER:-TILE_BUFFER]
+    tile_img = tile_img[TILE_BUFFER:-TILE_BUFFER, TILE_BUFFER:-TILE_BUFFER, :]
 
     write_tile_blob(y, x, z, land_mask.astype(np.uint8), ONAV_LAND_MASK_DB)
 
@@ -646,7 +619,7 @@ def create_tile(x, y, z) -> None:
         image_blob = file.read()
         write_tile_blob(y, x, z, image_blob, ONAV_BASEMAP_DB)
 
-    print(f"Completed tiles ({x}, {y}, {z}).")
+    print(f"Completed tile ({x}, {y}, {z}).")
 
 
 def write_tile_blob(x: int, y: int, z: int, blob_data: bytes, mbt_path: str) -> None:
@@ -678,8 +651,6 @@ def write_tile_blob(x: int, y: int, z: int, blob_data: bytes, mbt_path: str) -> 
                 time.sleep(sleep_time)
             else:
                 con.rollback()
-                # print(e)
-                # print(f"Unable to save tile ({x}, {y}, {z}) to {mbt_path}")
                 return
         finally:
             if attempt == max_retries or success:
@@ -735,8 +706,6 @@ def write_vector_tile(
                 time.sleep(sleep_time)
             else:
                 con.rollback()
-                # print(e)
-                # print(f"Unable to save tile ({x}, {y}, {z}) to {mbt_path}")
                 return
         finally:
             if attempt == max_retries or success:
@@ -777,43 +746,6 @@ def create_mbt_db(name: str) -> None:
     con.close()
 
 
-def process_tiles(z) -> None:
-    n_tiles = 2**z
-
-    tile_x, tile_y = np.meshgrid(range(n_tiles), range(n_tiles))
-
-    tile_idxs = np.stack(
-        [tile_x.ravel(), tile_y.ravel(), np.repeat(z, n_tiles**2)]
-    ).T.astype(np.int_)
-
-    print(tile_idxs.shape, (2**z) ** 2)
-    tile_groups = np.array_split(tile_idxs, MAX_WORKERS)
-
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [
-            executor.submit(process_tile_group, tile_group)
-            for tile_group in tile_groups
-        ]
-        for future in futures:
-            if future.exception():
-                print(f"A task crashed with error: {future.exception()}")
-
-    # for tile_group in tile_groups:
-    #     process_tile_group(tile_group)
-
-
-def process_tile_group(tile_group):
-
-    filtered_group = filter_tile_group(tile_group)
-    # for x, y, z in filtered_group:
-    #     create_tile(x, y, z)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(create_tile, x, y, z) for x, y, z in filtered_group]
-        for future in futures:
-            if future.exception():
-                print(f"A task crashed with error: {future.exception()}")
-
-
 def filter_tile_group(tile_group):
     x = tile_group[:, 0]
     y = tile_group[:, 1]
@@ -825,6 +757,8 @@ def filter_tile_group(tile_group):
     y_max = int(y.max())
 
     zoom = z[0]
+
+    filtered = tile_group
 
     try:
         connection = sqlite3.connect(ONAV_BASEMAP_DB)
@@ -839,22 +773,50 @@ def filter_tile_group(tile_group):
         selector.execute(sqlite)
         tile_coords = np.array(selector.fetchall())
 
-        mask = (tile_group[:, None, :2] == tile_coords).all(axis=2).any(axis=1)
-
-        filtered = tile_group[~mask]
+        if len(tile_coords) > 0:
+            mask = (tile_group[:, None, :2] == tile_coords).all(axis=2).any(axis=1)
+            filtered = tile_group[~mask]
 
     except Exception as e:
         print(e)
-        filtered = tile_group
 
     return filtered
 
 
-sqlite3.register_adapter(np.ndarray, adapt_array)
-sqlite3.register_converter("array", convert_array)
+def process_tiles(z) -> None:
+    n_tiles = 2**z
+
+    chunk_size = 500
+
+    all_tiles = product(range(n_tiles), range(n_tiles))
+
+    max_workers = z
+    if max_workers > MAX_WORKERS:
+        max_workers = MAX_WORKERS
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        while True:
+            tile_chunk = list(islice(all_tiles, chunk_size))
+            if not tile_chunk:
+                break
+
+            tile_group_arr = np.array([[x, y, z] for x, y in tile_chunk])
+
+            filtered_tiles = filter_tile_group(tile_group_arr)
+
+            if len(filtered_tiles) > 0:
+                executor.map(
+                    create_tile, filtered_tiles[:, 0], filtered_tiles[:, 1], repeat(z)
+                )
+
+        gc.collect()
+
 
 if __name__ == "__main__":
-    gdal.SetConfigOption("OGR_INTERLEAVED_READING", "YES")
+    mp.set_start_method("spawn", force=True)
+
+    sqlite3.register_adapter(np.ndarray, adapt_array)
+    sqlite3.register_converter("array", convert_array)
 
     if not os.path.exists(ONAV_BASEMAP_DB):
         create_mbt_db(ONAV_BASEMAP_DB)
@@ -865,21 +827,7 @@ if __name__ == "__main__":
     if not os.path.exists(ONAV_BATHY_DB):
         create_mbt_db(ONAV_BATHY_DB)
 
-    etopo_files = sorted(
-        glob.glob("/data/misc/ETOPO2022/15s/15s_surface_elev_netcdf/*.nc")
-    )
+    create_vrt()
 
-    # with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    #     executor.map(extract_etopo_contours, etopo_files)
-
-    # for etopo_file in etopo_files:
-    #     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    #         executor.map(etopo_px_contours, repeat(etopo_file), range(1, 15))
-
-    for z in range(5, 11):
+    for z in range(1, 15):
         process_tiles(z)
-    # process_tiles()
-
-    # for x in range(2**5):
-    #     for y in range(2**5):
-    #         create_tile(x, y, 5)
