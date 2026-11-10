@@ -8,8 +8,8 @@ import random
 import sqlite3
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from itertools import islice, product, repeat
+from concurrent.futures import ProcessPoolExecutor
+from itertools import islice, product
 from pathlib import Path
 
 import cartopy.crs as ccrs
@@ -40,7 +40,7 @@ warnings.filterwarnings("ignore", category=ShapeSkipWarning)
 gdal.UseExceptions()
 gdal.PushErrorHandler("CPLQuietErrorHandler")
 
-MAX_WORKERS = 8
+MAX_WORKERS = 10
 
 ONAV_BASEMAP_DB = "/data/misc/shapes/onav_basemap.mbtiles"
 ONAV_LAND_MASK_DB = "/data/misc/shapes/onav_land_mask.mbtiles"
@@ -486,7 +486,7 @@ def get_topo_contours(x, y, z, block_size):
         )
 
         band = ds.GetRasterBand(1)
-        tile_data = band.ReadAsArray()
+        tile_data = band.ReadAsArray(buf_type=gdal.GDT_Int16)
         ds = None
 
         padded_tile_data = np.pad(
@@ -506,13 +506,15 @@ def get_topo_contours(x, y, z, block_size):
     finally:
         gdal.SetConfigOption("GDAL_HTTP_UNSUB_OK", None)
 
-    return contour_mask
+    return contour_mask.astype(int)
 
 
 def create_tile(x, y, z, contour_mask) -> None:
     x = int(x)
     y = int(y)
     z = int(z)
+
+    contour_mask = contour_mask.astype(np.float32)
 
     print(f"Starting tile ({x}, {y}, {z}).")
     tile_mask = create_tile_mask(x, y, z)
@@ -598,7 +600,9 @@ def create_tile(x, y, z, contour_mask) -> None:
     land_mask = land_mask[TILE_BUFFER:-TILE_BUFFER, TILE_BUFFER:-TILE_BUFFER]
     tile_img = tile_img[TILE_BUFFER:-TILE_BUFFER, TILE_BUFFER:-TILE_BUFFER, :]
 
-    write_tile_blob(y, x, z, land_mask.astype(np.uint8), ONAV_LAND_MASK_DB)
+    land_mask_blob = gzip.compress(land_mask.astype(np.uint8).tobytes())
+
+    write_tile_blob(y, x, z, land_mask_blob, ONAV_LAND_MASK_DB)
 
     image_path = f"{TILE_IMG_PATH}onav_{x}_{y}_{z}.png"
 
@@ -773,11 +777,17 @@ def filter_tile_group(tile_group):
     return filtered
 
 
-def process_tile_block(block_x, block_y, z) -> None:
-
-    block_size = 2 ** (z - 8)
+def get_block_size(z: int) -> int:
+    z = int(z)
+    block_size = 2 ** (z - 7)
     if block_size < 1:
         block_size = 1
+    return int(block_size)
+
+
+def process_tile_block(block_x, block_y, z) -> None:
+
+    block_size = get_block_size(z)
 
     x_min = int(block_x * block_size)
     x_max = int(x_min + block_size)
@@ -792,12 +802,14 @@ def process_tile_block(block_x, block_y, z) -> None:
     filtered_tiles = filter_tile_group(tile_block_arr)
 
     if len(filtered_tiles) == 0:
-        print(f"Tiles ({x_min}, {y_min}, {z}) - ({x_max}, {y_max}, {z}) previously completed.")
+        print(
+            f"Tiles ({x_min}, {y_min}, {z}) - ({x_max}, {y_max}, {z}) previously completed."
+        )
         return
 
     contour_mask = get_topo_contours(x_min, y_min, z, block_size)
     if x_min == 0:
-        wrap_contours = get_topo_contours(2**z - block_size - 1, y_min, z, block_size)
+        wrap_contours = get_topo_contours(2**z - block_size, y_min, z, block_size)
         contour_mask[:, :TILE_BUFFER] = wrap_contours[
             :, -TILE_BUFFER * 2 : -TILE_BUFFER
         ]
@@ -808,28 +820,24 @@ def process_tile_block(block_x, block_y, z) -> None:
 
     contour_masks = [
         contour_mask[
-            (x - x_min) * TILE_SIZE : (x + 1 - x_min) * TILE_SIZE + 2 * TILE_BUFFER,
             (y - y_min) * TILE_SIZE : (y + 1 - y_min) * TILE_SIZE + 2 * TILE_BUFFER,
+            (x - x_min) * TILE_SIZE : (x + 1 - x_min) * TILE_SIZE + 2 * TILE_BUFFER,
         ]
         for x, y, _ in filtered_tiles
     ]
 
-    with ThreadPoolExecutor() as thread_exec:
-        if len(filtered_tiles) > 0:
-            thread_exec.map(
-                create_tile,
-                filtered_tiles[:, 0],
-                filtered_tiles[:, 1],
-                repeat(z),
-                contour_masks,
-            )
+    if len(filtered_tiles) > 0:
+        for filtered_tile in filtered_tiles:
+            x, y, z = filtered_tile
+            contour_mask = contour_masks.pop(0)
+            create_tile(x, y, z, contour_mask)
 
 
 def process_tiles(z) -> None:
+    print(f"Starting zoom {z}")
+
     n_tiles = 2**z
-    block_size = 2 ** (z - 8)
-    if block_size < 1:
-        block_size = 1
+    block_size = get_block_size(z)
 
     n_blocks = int(n_tiles / block_size)
 
@@ -878,5 +886,5 @@ if __name__ == "__main__":
 
     create_vrt()
 
-    for z in range(12, 15):
+    for z in range(1, 15):
         process_tiles(z)
