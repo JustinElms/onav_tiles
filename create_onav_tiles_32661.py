@@ -260,11 +260,6 @@ def create_tile_mask(x, y, z) -> np.ndarray:
         np.array([85, 85, 85, 85, 85, 90]),
     )
 
-    n_pole_x_min = n_pole_bounds[:, 0].min()
-    n_pole_x_max = n_pole_bounds[:, 0].max()
-    n_pole_y_min = n_pole_bounds[:, 1].min()
-    n_pole_y_max = n_pole_bounds[:, 1].max()
-
     np_geom = Polygon(n_pole_bounds[:, :2])
 
     np_df = gpd.GeoDataFrame(
@@ -860,5 +855,5 @@ if __name__ == "__main__":
 
     create_vrt()
 
-    for z in range(1, 15):
+    for z in range(1, 9):
         process_tiles(z)
